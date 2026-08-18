@@ -19,6 +19,10 @@ import { runJxa } from "./jxa";
 const CONFIG = {
 	MAX_EMAILS: 20,
 	MAX_CONTENT_PREVIEW: 300,
+	// Message bodies cost ~5s each over Exchange, so a 10-message listing can
+	// blow past the MCP client's own request timeout. Bound the body fetching
+	// and mark whatever we had to skip, rather than returning nothing at all.
+	CONTENT_BUDGET_SECS: 15,
 	TIMEOUT_MS: 120000,
 };
 
@@ -90,6 +94,7 @@ function collectorScript(pickBody: string, limit: number, account?: string): str
            })()`
 		: "M.inbox";
 	return `
+ObjC.import('Foundation');
 const M = Application("Mail");
 const box = ${boxExpr};
 const msgs = box.messages;
@@ -100,13 +105,24 @@ const date = msgs.dateSent();
 const n = read.length;
 const picked = [];
 ${pickBody}
+// The unified inbox is grouped by ACCOUNT, not globally sorted by date: each
+// account's block is internally newest-first, but block order is arbitrary.
+// Taking the first N matches therefore returns whichever account sorts first
+// (burying today's mail from a busier account behind another's stale mail).
+// Sort by date descending before truncating so "latest"/"unread" mean it.
+picked.sort(function (a, b) { return (date[b] || 0) - (date[a] || 0); });
 const out = [];
+const contentDeadline = $.NSDate.dateWithTimeIntervalSinceNow(${CONFIG.CONTENT_BUDGET_SECS});
 for (let k = 0; k < picked.length && k < ${limit}; k++) {
   const i = picked[k];
   let content = "";
-  try {
-    content = String(msgs[i].content() || "");
-  } catch (e) { content = "[Content not available]"; }
+  if ($.NSDate.date.compare(contentDeadline) >= 0) {
+    content = "[Body not fetched: content budget exceeded]";
+  } else {
+    try {
+      content = String(msgs[i].content() || "");
+    } catch (e) { content = "[Content not available]"; }
+  }
   if (content.length > ${CONFIG.MAX_CONTENT_PREVIEW}) {
     content = content.slice(0, ${CONFIG.MAX_CONTENT_PREVIEW}) + "...";
   }
@@ -129,7 +145,7 @@ async function getUnreadMails(limit = 10, account?: string): Promise<EmailMessag
 		if (!access.hasAccess) throw new Error(access.message);
 		const max = Math.min(limit, CONFIG.MAX_EMAILS);
 		// Inbox is ordered newest-first, so a forward scan yields newest unread.
-		const pick = `for (let i = 0; i < n && picked.length < ${max}; i++) { if (read[i] === false) picked.push(i); }`;
+		const pick = `for (let i = 0; i < n; i++) { if (read[i] === false) picked.push(i); }`;
 		return await runJxa<EmailMessage[]>(collectorScript(pick, max, account), CONFIG.TIMEOUT_MS);
 	} catch (error) {
 		console.error(
@@ -147,7 +163,7 @@ async function searchMails(searchTerm: string, limit = 10, account?: string): Pr
 		const max = Math.min(limit, CONFIG.MAX_EMAILS);
 		const pick = `
 const q = ${jsLit(searchTerm.toLowerCase().trim())};
-for (let i = 0; i < n && picked.length < ${max}; i++) {
+for (let i = 0; i < n; i++) {
   const s = String(subj[i] || "").toLowerCase();
   const f = String(send[i] || "").toLowerCase();
   if (s.indexOf(q) !== -1 || f.indexOf(q) !== -1) picked.push(i);
@@ -166,7 +182,7 @@ async function getLatestMails(account?: string, limit = 10): Promise<EmailMessag
 		const access = await requestMailAccess();
 		if (!access.hasAccess) throw new Error(access.message);
 		const max = Math.min(limit, CONFIG.MAX_EMAILS);
-		const pick = `for (let i = 0; i < n && picked.length < ${max}; i++) { picked.push(i); }`;
+		const pick = `for (let i = 0; i < n; i++) { picked.push(i); }`;
 		return await runJxa<EmailMessage[]>(collectorScript(pick, max, account), CONFIG.TIMEOUT_MS);
 	} catch (error) {
 		console.error(
