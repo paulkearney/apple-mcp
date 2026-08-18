@@ -1,4 +1,5 @@
 import { runAppleScript } from "run-applescript";
+import { runJxa, memoize } from "./jxa";
 
 // Configuration
 const CONFIG = {
@@ -490,12 +491,156 @@ async function getNotesByDateRange(
 	}
 }
 
+
+/* ------------------------------------------------------------------ *
+ * Patched read paths.
+ *
+ * The originals ran AppleScript and then tested `Array.isArray(result)`
+ * on osascript's string stdout, which is never an array — so every list
+ * silently collapsed to []. These fetch all notes in one bulk JXA call
+ * (~0.5s for 237 notes) and filter in JS.
+ * ------------------------------------------------------------------ */
+
+type RawNote = {
+	name: string;
+	content: string;
+	folder: string;
+	creationDate: string | null;
+	modificationDate: string | null;
+};
+
+const loadAllNotes = memoize<RawNote[]>(async () => {
+	const script = `
+// Bulk "notes.container.name()" returns nulls, so walk folders to keep the
+// note -> folder association while still using one bulk fetch per folder.
+const N = Application("Notes");
+const folders = N.folders;
+const fnames = folders.name();
+const out = [];
+for (let i = 0; i < fnames.length; i++) {
+  const fld = folders[i];
+  let names = [], bodies = [], created = [], modified = [];
+  try { names = fld.notes.name(); } catch (e) { continue; }
+  try { bodies = fld.notes.plaintext(); } catch (e) {}
+  try { created = fld.notes.creationDate(); } catch (e) {}
+  try { modified = fld.notes.modificationDate(); } catch (e) {}
+  for (let j = 0; j < names.length; j++) {
+    out.push({
+      name: String(names[j] || "Untitled"),
+      content: String(bodies[j] || ""),
+      folder: String(fnames[i] || ""),
+      creationDate: created[j] ? new Date(created[j]).toISOString() : null,
+      modificationDate: modified[j] ? new Date(modified[j]).toISOString() : null
+    });
+  }
+}
+JSON.stringify(out);
+`;
+	return await runJxa<RawNote[]>(script, 120000);
+}, 60000);
+
+function toNote(r: RawNote): Note {
+	return {
+		name: r.name,
+		content: r.content,
+		creationDate: r.creationDate ? new Date(r.creationDate) : undefined,
+		modificationDate: r.modificationDate ? new Date(r.modificationDate) : undefined,
+	};
+}
+
+async function getAllNotesFast(): Promise<Note[]> {
+	try {
+		const access = await requestNotesAccess();
+		if (!access.hasAccess) throw new Error(access.message);
+		return (await loadAllNotes()).map(toNote);
+	} catch (error) {
+		console.error(
+			`Error getting notes: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return [];
+	}
+}
+
+async function findNoteFast(searchText: string): Promise<Note[]> {
+	try {
+		if (!searchText || !searchText.trim()) return [];
+		const q = searchText.toLowerCase().trim();
+		const all = await loadAllNotes();
+		// Title matches first, then body matches.
+		const byTitle = all.filter((n) => n.name.toLowerCase().includes(q));
+		const byBody = all.filter(
+			(n) => !n.name.toLowerCase().includes(q) && n.content.toLowerCase().includes(q),
+		);
+		return [...byTitle, ...byBody].map(toNote);
+	} catch (error) {
+		console.error(
+			`Error finding note: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return [];
+	}
+}
+
+async function getNotesFromFolderFast(
+	folderName: string,
+): Promise<{ success: boolean; notes?: Note[]; message?: string }> {
+	try {
+		if (!folderName || !folderName.trim()) {
+			return { success: false, message: "Folder name is required" };
+		}
+		const target = folderName.toLowerCase().trim();
+		const all = await loadAllNotes();
+		const hits = all.filter((n) => n.folder.toLowerCase() === target);
+		if (hits.length === 0) {
+			const known = [...new Set(all.map((n) => n.folder).filter(Boolean))];
+			return {
+				success: false,
+				message: `No notes found in folder "${folderName}". Available folders: ${known.join(", ")}`,
+			};
+		}
+		return { success: true, notes: hits.map(toNote) };
+	} catch (error) {
+		return {
+			success: false,
+			message: `Error getting notes from folder: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+}
+
+async function getRecentNotesFromFolderFast(
+	folderName: string,
+	limit: number = 5,
+): Promise<{ success: boolean; notes?: Note[]; message?: string }> {
+	const result = await getNotesFromFolderFast(folderName);
+	if (!result.success || !result.notes) return result;
+	const sorted = [...result.notes].sort(
+		(a, b) => (b.modificationDate?.getTime() ?? 0) - (a.modificationDate?.getTime() ?? 0),
+	);
+	return { success: true, notes: sorted.slice(0, limit) };
+}
+
+async function getNotesByDateRangeFast(
+	folderName: string,
+	fromDate?: string,
+	toDate?: string,
+	limit: number = 20,
+): Promise<{ success: boolean; notes?: Note[]; message?: string }> {
+	const result = await getNotesFromFolderFast(folderName);
+	if (!result.success || !result.notes) return result;
+	const from = fromDate ? new Date(fromDate).getTime() : Number.NEGATIVE_INFINITY;
+	const to = toDate ? new Date(toDate).getTime() : Number.POSITIVE_INFINITY;
+	const inRange = result.notes.filter((n) => {
+		const t = n.modificationDate?.getTime() ?? n.creationDate?.getTime();
+		return t !== undefined && t >= from && t <= to;
+	});
+	return { success: true, notes: inRange.slice(0, limit) };
+}
+
 export default {
-	getAllNotes,
-	findNote,
+	getAllNotes: getAllNotesFast,
+	findNote: findNoteFast,
 	createNote,
-	getNotesFromFolder,
-	getRecentNotesFromFolder,
-	getNotesByDateRange,
+	getNotesFromFolder: getNotesFromFolderFast,
+	getRecentNotesFromFolder: getRecentNotesFromFolderFast,
+	getNotesByDateRange: getNotesByDateRangeFast,
 	requestNotesAccess,
 };

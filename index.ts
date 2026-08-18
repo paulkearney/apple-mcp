@@ -196,7 +196,32 @@ function initServer() {
 		tools,
 	}));
 
-	server.setRequestHandler(CallToolRequestSchema, async (request) => {
+	// Hard ceiling on any single tool call. Without this a slow Apple Event
+	// (Maps.activate() in particular) leaves the client waiting forever with
+	// no response, which is indistinguishable from the server being hung.
+	const TOOL_TIMEOUT_MS = Number(process.env.APPLE_MCP_TIMEOUT_MS || 90000);
+
+	const withTimeout = async <T>(label: string, work: Promise<T>): Promise<T> => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				work,
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(
+						() => reject(new Error(
+							`Tool "${label}" timed out after ${TOOL_TIMEOUT_MS}ms. ` +
+							`Set APPLE_MCP_TIMEOUT_MS to raise this limit.`)),
+						TOOL_TIMEOUT_MS,
+					);
+				}),
+			]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	};
+
+	server.setRequestHandler(CallToolRequestSchema, async (request) =>
+		withTimeout(request.params?.name ?? "unknown", (async () => {
 		try {
 			const { name, arguments: args } = request.params;
 
@@ -1294,7 +1319,8 @@ end tell`;
 				isError: true,
 			};
 		}
-	});
+	})()),
+	);
 
 	// Start the server transport
 	console.error("Setting up MCP server transport...");

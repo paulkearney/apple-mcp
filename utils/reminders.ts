@@ -1,4 +1,5 @@
 import { runAppleScript } from "run-applescript";
+import { runJxa, memoize } from "./jxa";
 
 // Configuration
 const CONFIG = {
@@ -379,12 +380,153 @@ end tell`;
 	}
 }
 
+
+/* ------------------------------------------------------------------ *
+ * Patched read paths.
+ *
+ * The originals either tested `Array.isArray(result)` on osascript's
+ * string stdout (always false -> []) or bailed out entirely with
+ * "Complex reminder queries are too slow and unreliable". EventKit
+ * returns the whole store (3935 reminders here) in ~1.4s.
+ * ------------------------------------------------------------------ */
+
+const EK_REMINDERS = `
+ObjC.import('EventKit');
+ObjC.import('Foundation');
+const store = $.EKEventStore.alloc.init;
+const cals = store.calendarsForEntityType(1);
+const pred = store.predicateForRemindersInCalendars(cals);
+let done = false;
+const res = [];
+const iso = function (d) {
+  try { return d && d.js ? new Date(d.js).toISOString() : null; } catch (e) { return null; }
+};
+store.fetchRemindersMatchingPredicateCompletion(pred, function (reminders) {
+  const n = parseInt(String(reminders.count), 10) || 0;
+  for (let i = 0; i < n; i++) {
+    const r = reminders.objectAtIndex(i);
+    let body = null, prio = 0;
+    try { body = ObjC.unwrap(r.notes) || ""; } catch (e) { body = ""; }
+    try { prio = parseInt(String(r.priority), 10) || 0; } catch (e) {}
+    res.push({
+      name: String(ObjC.unwrap(r.title) || ""),
+      id: String(ObjC.unwrap(r.calendarItemIdentifier) || ""),
+      body: String(body),
+      completed: r.completed === true,
+      dueDate: iso(r.dueDateComponents ? r.dueDateComponents.date : null),
+      listName: String(ObjC.unwrap(r.calendar.title) || ""),
+      completionDate: iso(r.completionDate),
+      creationDate: iso(r.creationDate),
+      modificationDate: iso(r.lastModifiedDate),
+      remindMeDate: null,
+      priority: prio
+    });
+  }
+  done = true;
+});
+const deadline = $.NSDate.dateWithTimeIntervalSinceNow(90);
+while (!done && $.NSDate.date.compare(deadline) < 0) {
+  $.NSRunLoop.currentRunLoop.runModeBeforeDate($.NSDefaultRunLoopMode, $.NSDate.dateWithTimeIntervalSinceNow(0.05));
+}
+JSON.stringify(res);
+`;
+
+const loadReminders = memoize<Reminder[]>(
+	async () => await runJxa<Reminder[]>(EK_REMINDERS, 120000),
+	30000,
+);
+
+async function getAllListsFast(): Promise<ReminderList[]> {
+	try {
+		const script = `
+ObjC.import('EventKit');
+const store = $.EKEventStore.alloc.init;
+const cals = store.calendarsForEntityType(1);
+const n = parseInt(String(cals.count), 10) || 0;
+const out = [];
+for (let i = 0; i < n; i++) {
+  const c = cals.objectAtIndex(i);
+  out.push({ name: String(ObjC.unwrap(c.title) || ""), id: String(ObjC.unwrap(c.calendarIdentifier) || "") });
+}
+JSON.stringify(out);
+`;
+		return (await runJxa<ReminderList[]>(script, 30000)) || [];
+	} catch (error) {
+		console.error(
+			`Error getting reminder lists: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return [];
+	}
+}
+
+async function getAllRemindersFast(listName?: string): Promise<Reminder[]> {
+	try {
+		const all = await loadReminders();
+		if (!listName || !listName.trim()) return all;
+		const target = listName.toLowerCase().trim();
+		return all.filter((r) => String(r.listName).toLowerCase() === target);
+	} catch (error) {
+		console.error(
+			`Error getting reminders: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return [];
+	}
+}
+
+async function searchRemindersFast(searchText: string): Promise<Reminder[]> {
+	try {
+		if (!searchText || !searchText.trim()) return [];
+		const q = searchText.toLowerCase().trim();
+		const all = await loadReminders();
+		return all.filter(
+			(r) =>
+				String(r.name).toLowerCase().includes(q) ||
+				String(r.body || "").toLowerCase().includes(q),
+		);
+	} catch (error) {
+		console.error(
+			`Error searching reminders: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return [];
+	}
+}
+
+// Returns any[] (not Reminder[]) because `props` projects an arbitrary subset
+// of fields — the same contract the original had.
+async function getRemindersFromListByIdFast(
+	listId: string,
+	props?: string[],
+): Promise<any[]> {
+	try {
+		if (!listId || !listId.trim()) return [];
+		const lists = await getAllListsFast();
+		const match = lists.find((l) => l.id === listId);
+		if (!match) return [];
+		const reminders = await getAllRemindersFast(match.name);
+		if (!props || props.length === 0) return reminders;
+		return reminders.map((r) => {
+			const picked: Record<string, unknown> = {};
+			for (const key of props) {
+				if (key in (r as unknown as Record<string, unknown>)) {
+					picked[key] = (r as unknown as Record<string, unknown>)[key];
+				}
+			}
+			return picked;
+		});
+	} catch (error) {
+		console.error(
+			`Error getting reminders by list id: ${error instanceof Error ? error.message : String(error)}`,
+		);
+		return [];
+	}
+}
+
 export default {
-	getAllLists,
-	getAllReminders,
-	searchReminders,
+	getAllLists: getAllListsFast,
+	getAllReminders: getAllRemindersFast,
+	searchReminders: searchRemindersFast,
 	createReminder,
 	openReminder,
-	getRemindersFromListById,
+	getRemindersFromListById: getRemindersFromListByIdFast,
 	requestRemindersAccess,
 };
