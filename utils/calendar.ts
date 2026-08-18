@@ -37,13 +37,36 @@ const MAX_RANGE_DAYS = 1400;
 
 async function checkCalendarAccess(): Promise<boolean> {
     try {
-        await runJxa<unknown>(
+        // Must actually *request* access, not just read: calendarsForEntityType
+        // returns 0 when unauthorized without ever prompting, which looks
+        // identical to an empty calendar. Requesting triggers the TCC prompt
+        // once, after which the grant is recorded and this returns instantly.
+        const ok = await runJxa<boolean>(
             `ObjC.import('EventKit');
-             const s = $.EKEventStore.alloc.init;
-             JSON.stringify(String(s.calendarsForEntityType(0).count));`,
-            20000,
+             ObjC.import('Foundation');
+             const store = $.EKEventStore.alloc.init;
+             // Fast path: if the grant is already in place this returns a
+             // non-zero count immediately, so no run loop is entered.
+             let n = parseInt(String(store.calendarsForEntityType(0).count), 10) || 0;
+             if (n === 0) {
+               // Unauthorized reads return 0 without prompting, which is
+               // indistinguishable from "no calendars" -- so ask explicitly.
+               let done = false;
+               if (typeof store.requestFullAccessToEventsWithCompletion === 'function') {
+                 store.requestFullAccessToEventsWithCompletion(function (g, err) { done = true; });
+               } else {
+                 store.requestAccessToEntityTypeCompletion(0, function (g, err) { done = true; });
+               }
+               const deadline = $.NSDate.dateWithTimeIntervalSinceNow(45);
+               while (!done && $.NSDate.date.compare(deadline) < 0) {
+                 $.NSRunLoop.currentRunLoop.runModeBeforeDate($.NSDefaultRunLoopMode, $.NSDate.dateWithTimeIntervalSinceNow(0.05));
+               }
+               n = parseInt(String($.EKEventStore.alloc.init.calendarsForEntityType(0).count), 10) || 0;
+             }
+             JSON.stringify(n > 0);`,
+            60000,
         );
-        return true;
+        return ok === true;
     } catch (error) {
         console.error(
             `Cannot access Calendar: ${error instanceof Error ? error.message : String(error)}`,
