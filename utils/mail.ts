@@ -67,10 +67,31 @@ async function requestMailAccess(): Promise<{ hasAccess: boolean; message: strin
  * Shared collector: bulk-reads metadata for the inbox, selects indices with
  * `pick`, then fetches content only for the messages actually returned.
  */
-function collectorScript(pickBody: string, limit: number): string {
+function collectorScript(pickBody: string, limit: number, account?: string): string {
+	// Scoping to one account uses that account's INBOX rather than the unified
+	// inbox. Never use a `whose(...)` clause here: Mail evaluates it per message
+	// (37s on one 68k mailbox), which is what wedged Mail.app before.
+	const boxExpr = account
+		? `(function () {
+             const accts = M.accounts;
+             const names = accts.name();
+             let acct = null;
+             for (let i = 0; i < names.length; i++) {
+               if (String(names[i]) === ${jsLit(account)}) { acct = accts[i]; break; }
+             }
+             if (!acct) throw new Error("No such account: " + ${jsLit(account)});
+             const boxes = acct.mailboxes;
+             const bn = boxes.name();
+             for (let i = 0; i < bn.length; i++) {
+               const nm = String(bn[i]).toLowerCase();
+               if (nm === "inbox") return boxes[i];
+             }
+             return acct.mailboxes[0];
+           })()`
+		: "M.inbox";
 	return `
 const M = Application("Mail");
-const box = M.inbox;
+const box = ${boxExpr};
 const msgs = box.messages;
 const read = msgs.readStatus();
 const subj = msgs.subject();
@@ -95,21 +116,21 @@ for (let k = 0; k < picked.length && k < ${limit}; k++) {
     dateSent: String(date[i] || ""),
     content: content,
     isRead: read[i] === true,
-    mailbox: "Inbox"
+    mailbox: ${account ? JSON.stringify(account + " - Inbox") : '"Inbox"'}
   });
 }
 JSON.stringify(out);
 `;
 }
 
-async function getUnreadMails(limit = 10): Promise<EmailMessage[]> {
+async function getUnreadMails(limit = 10, account?: string): Promise<EmailMessage[]> {
 	try {
 		const access = await requestMailAccess();
 		if (!access.hasAccess) throw new Error(access.message);
 		const max = Math.min(limit, CONFIG.MAX_EMAILS);
 		// Inbox is ordered newest-first, so a forward scan yields newest unread.
 		const pick = `for (let i = 0; i < n && picked.length < ${max}; i++) { if (read[i] === false) picked.push(i); }`;
-		return await runJxa<EmailMessage[]>(collectorScript(pick, max), CONFIG.TIMEOUT_MS);
+		return await runJxa<EmailMessage[]>(collectorScript(pick, max, account), CONFIG.TIMEOUT_MS);
 	} catch (error) {
 		console.error(
 			`Error getting unread emails: ${error instanceof Error ? error.message : String(error)}`,
@@ -118,7 +139,7 @@ async function getUnreadMails(limit = 10): Promise<EmailMessage[]> {
 	}
 }
 
-async function searchMails(searchTerm: string, limit = 10): Promise<EmailMessage[]> {
+async function searchMails(searchTerm: string, limit = 10, account?: string): Promise<EmailMessage[]> {
 	try {
 		const access = await requestMailAccess();
 		if (!access.hasAccess) throw new Error(access.message);
@@ -131,7 +152,7 @@ for (let i = 0; i < n && picked.length < ${max}; i++) {
   const f = String(send[i] || "").toLowerCase();
   if (s.indexOf(q) !== -1 || f.indexOf(q) !== -1) picked.push(i);
 }`;
-		return await runJxa<EmailMessage[]>(collectorScript(pick, max), CONFIG.TIMEOUT_MS);
+		return await runJxa<EmailMessage[]>(collectorScript(pick, max, account), CONFIG.TIMEOUT_MS);
 	} catch (error) {
 		console.error(
 			`Error searching emails: ${error instanceof Error ? error.message : String(error)}`,
@@ -140,13 +161,13 @@ for (let i = 0; i < n && picked.length < ${max}; i++) {
 	}
 }
 
-async function getLatestMails(_account?: string, limit = 10): Promise<EmailMessage[]> {
+async function getLatestMails(account?: string, limit = 10): Promise<EmailMessage[]> {
 	try {
 		const access = await requestMailAccess();
 		if (!access.hasAccess) throw new Error(access.message);
 		const max = Math.min(limit, CONFIG.MAX_EMAILS);
 		const pick = `for (let i = 0; i < n && picked.length < ${max}; i++) { picked.push(i); }`;
-		return await runJxa<EmailMessage[]>(collectorScript(pick, max), CONFIG.TIMEOUT_MS);
+		return await runJxa<EmailMessage[]>(collectorScript(pick, max, account), CONFIG.TIMEOUT_MS);
 	} catch (error) {
 		console.error(
 			`Error getting latest emails: ${error instanceof Error ? error.message : String(error)}`,

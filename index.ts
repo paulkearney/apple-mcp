@@ -541,143 +541,14 @@ function initServer() {
 
 						switch (args.operation) {
 							case "unread": {
-								// If an account is specified, we'll try to search specifically in that account
-								let emails;
-								if (args.account) {
-									console.error(
-										`Getting unread emails for account: ${args.account}`,
-									);
-									// Use AppleScript to get unread emails from specific account
-									const script = `
-tell application "Mail"
-    set resultList to {}
-    try
-        set targetAccount to first account whose name is "${args.account.replace(/"/g, '\\"')}"
-
-        -- Get mailboxes for this account
-        set acctMailboxes to every mailbox of targetAccount
-
-        -- If mailbox is specified, only search in that mailbox
-        set mailboxesToSearch to acctMailboxes
-        ${
-					args.mailbox
-						? `
-        set mailboxesToSearch to {}
-        repeat with mb in acctMailboxes
-            if name of mb is "${args.mailbox.replace(/"/g, '\\"')}" then
-                set mailboxesToSearch to {mb}
-                exit repeat
-            end if
-        end repeat
-        `
-						: ""
-				}
-
-        -- Search specified mailboxes
-        repeat with mb in mailboxesToSearch
-            try
-                set unreadMessages to (messages of mb whose read status is false)
-                if (count of unreadMessages) > 0 then
-                    set msgLimit to ${args.limit || 10}
-                    if (count of unreadMessages) < msgLimit then
-                        set msgLimit to (count of unreadMessages)
-                    end if
-
-                    repeat with i from 1 to msgLimit
-                        try
-                            set currentMsg to item i of unreadMessages
-                            set msgData to {subject:(subject of currentMsg), sender:(sender of currentMsg), ¬
-                                        date:(date sent of currentMsg) as string, mailbox:(name of mb)}
-
-                            -- Try to get content if possible
-                            try
-                                set msgContent to content of currentMsg
-                                if length of msgContent > 500 then
-                                    set msgContent to (text 1 thru 500 of msgContent) & "..."
-                                end if
-                                set msgData to msgData & {content:msgContent}
-                            on error
-                                set msgData to msgData & {content:"[Content not available]"}
-                            end try
-
-                            set end of resultList to msgData
-                        on error
-                            -- Skip problematic messages
-                        end try
-                    end repeat
-
-                    if (count of resultList) ≥ ${args.limit || 10} then exit repeat
-                end if
-            on error
-                -- Skip problematic mailboxes
-            end try
-        end repeat
-    on error errMsg
-        return "Error: " & errMsg
-    end try
-
-    return resultList
-end tell`;
-
-									try {
-										const asResult = await runAppleScript(script);
-										if (asResult && asResult.startsWith("Error:")) {
-											throw new Error(asResult);
-										}
-
-										// Parse the results - similar to general getUnreadMails
-										const emailData = [];
-										const matches = asResult.match(/\{([^}]+)\}/g);
-										if (matches && matches.length > 0) {
-											for (const match of matches) {
-												try {
-													const props = match
-														.substring(1, match.length - 1)
-														.split(",");
-													const email: any = {};
-
-													props.forEach((prop) => {
-														const parts = prop.split(":");
-														if (parts.length >= 2) {
-															const key = parts[0].trim();
-															const value = parts.slice(1).join(":").trim();
-															email[key] = value;
-														}
-													});
-
-													if (email.subject || email.sender) {
-														emailData.push({
-															subject: email.subject || "No subject",
-															sender: email.sender || "Unknown sender",
-															dateSent: email.date || new Date().toString(),
-															content:
-																email.content || "[Content not available]",
-															isRead: false,
-															mailbox: `${args.account} - ${email.mailbox || "Unknown"}`,
-														});
-													}
-												} catch (parseError) {
-													console.error(
-														"Error parsing email match:",
-														parseError,
-													);
-												}
-											}
-										}
-
-										emails = emailData;
-									} catch (error) {
-										console.error(
-											"Error getting account-specific emails:",
-											error,
-										);
-										// Fallback to general method if specific account fails
-										emails = await mailModule.getUnreadMails(args.limit);
-									}
-								} else {
-									// No account specified, use the general method
-									emails = await mailModule.getUnreadMails(args.limit);
-								}
+								// Account scoping lives in the mail module now. The inline
+								// AppleScript that used to live here ran
+								// `messages of mb whose read status is false` over every mailbox
+								// of the account, which pegs Mail.app and never returns.
+								const emails = await mailModule.getUnreadMails(
+									args.limit,
+									args.account,
+								);
 
 								return {
 									content: [
@@ -708,6 +579,7 @@ end tell`;
 								const emails = await mailModule.searchMails(
 									args.searchTerm,
 									args.limit,
+									args.account,
 								);
 								return {
 									content: [
