@@ -151,7 +151,7 @@ const CONTACTS_TOOL: Tool = {
         },
         listName: {
           type: "string",
-          description: "Name of the list to create the reminder in (optional for create operation)"
+          description: "Name of a reminder list: the list to create the reminder in (create operation), or the list to restrict results to (list operation)"
         },
         listId: {
           type: "string",
@@ -171,6 +171,22 @@ const CONTACTS_TOOL: Tool = {
         dueDate: {
           type: "string",
           description: "Due date for the reminder in ISO format (optional for create operation)"
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of reminders to return (optional, defaults to 50, for list, search and listById operations)"
+        },
+        includeCompleted: {
+          type: "boolean",
+          description: "Include completed reminders (optional, defaults to false, for list, search and listById operations)"
+        },
+        dueAfter: {
+          type: "string",
+          description: "Only return reminders due at or after this ISO timestamp (optional, for list, search and listById operations). Setting either date bound also excludes reminders with no due date."
+        },
+        dueBefore: {
+          type: "string",
+          description: "Only return reminders due strictly before this ISO timestamp (optional, for list, search and listById operations). Setting either date bound also excludes reminders with no due date."
         }
       },
       required: ["operation"]

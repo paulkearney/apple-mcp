@@ -31,6 +31,58 @@ interface Reminder {
 	priority?: number;
 }
 
+/** Narrowing applied to bulk reminder reads. */
+interface ReminderFilter {
+	/** Include completed reminders. Defaults to false. */
+	includeCompleted?: boolean;
+	/** Keep reminders due strictly before this ISO timestamp. */
+	dueBefore?: string;
+	/** Keep reminders due at or after this ISO timestamp. */
+	dueAfter?: string;
+}
+
+/**
+ * Applies a ReminderFilter. Note that setting either date bound also drops
+ * undated reminders -- "due in this window" can't be true of something with no
+ * due date, and 3.7k undated items would otherwise swamp the result.
+ */
+function applyReminderFilter<T extends { completed?: boolean; dueDate?: string | null }>(
+	items: T[],
+	filter?: ReminderFilter,
+): T[] {
+	const includeCompleted = filter?.includeCompleted === true;
+	const after = filter?.dueAfter ? Date.parse(filter.dueAfter) : Number.NaN;
+	const before = filter?.dueBefore ? Date.parse(filter.dueBefore) : Number.NaN;
+	const bounded = !Number.isNaN(after) || !Number.isNaN(before);
+
+	return items.filter((r) => {
+		if (!includeCompleted && r.completed) return false;
+		if (!bounded) return true;
+		if (!r.dueDate) return false;
+		const due = Date.parse(String(r.dueDate));
+		if (Number.isNaN(due)) return false;
+		if (!Number.isNaN(after) && due < after) return false;
+		if (!Number.isNaN(before) && due >= before) return false;
+		return true;
+	});
+}
+
+/** Due-dated reminders first, soonest to latest; undated keep their original order. */
+function sortByDueDate<T extends { dueDate?: string | null }>(items: T[]): T[] {
+	return items
+		.map((item, index) => ({ item, index }))
+		.sort((a, b) => {
+			const da = a.item.dueDate ? Date.parse(String(a.item.dueDate)) : Number.NaN;
+			const db = b.item.dueDate ? Date.parse(String(b.item.dueDate)) : Number.NaN;
+			const aHas = !Number.isNaN(da);
+			const bHas = !Number.isNaN(db);
+			if (aHas && bHas && da !== db) return da - db;
+			if (aHas !== bHas) return aHas ? -1 : 1;
+			return a.index - b.index;
+		})
+		.map((entry) => entry.item);
+}
+
 /**
  * Check if Reminders app is accessible
  */
@@ -459,12 +511,17 @@ JSON.stringify(out);
 	}
 }
 
-async function getAllRemindersFast(listName?: string): Promise<Reminder[]> {
+async function getAllRemindersFast(
+	listName?: string,
+	filter?: ReminderFilter,
+): Promise<Reminder[]> {
 	try {
 		const all = await loadReminders();
-		if (!listName || !listName.trim()) return all;
-		const target = listName.toLowerCase().trim();
-		return all.filter((r) => String(r.listName).toLowerCase() === target);
+		const target = listName?.toLowerCase().trim();
+		const scoped = target
+			? all.filter((r) => String(r.listName).toLowerCase() === target)
+			: all;
+		return sortByDueDate(applyReminderFilter(scoped, filter));
 	} catch (error) {
 		console.error(
 			`Error getting reminders: ${error instanceof Error ? error.message : String(error)}`,
@@ -473,16 +530,20 @@ async function getAllRemindersFast(listName?: string): Promise<Reminder[]> {
 	}
 }
 
-async function searchRemindersFast(searchText: string): Promise<Reminder[]> {
+async function searchRemindersFast(
+	searchText: string,
+	filter?: ReminderFilter,
+): Promise<Reminder[]> {
 	try {
 		if (!searchText || !searchText.trim()) return [];
 		const q = searchText.toLowerCase().trim();
 		const all = await loadReminders();
-		return all.filter(
+		const matches = all.filter(
 			(r) =>
 				String(r.name).toLowerCase().includes(q) ||
 				String(r.body || "").toLowerCase().includes(q),
 		);
+		return sortByDueDate(applyReminderFilter(matches, filter));
 	} catch (error) {
 		console.error(
 			`Error searching reminders: ${error instanceof Error ? error.message : String(error)}`,
@@ -496,13 +557,16 @@ async function searchRemindersFast(searchText: string): Promise<Reminder[]> {
 async function getRemindersFromListByIdFast(
 	listId: string,
 	props?: string[],
+	filter?: ReminderFilter,
 ): Promise<any[]> {
 	try {
 		if (!listId || !listId.trim()) return [];
 		const lists = await getAllListsFast();
 		const match = lists.find((l) => l.id === listId);
 		if (!match) return [];
-		const reminders = await getAllRemindersFast(match.name);
+		// Filter before projecting: `props` may omit completed/dueDate, which
+		// applyReminderFilter needs to see.
+		const reminders = await getAllRemindersFast(match.name, filter);
 		if (!props || props.length === 0) return reminders;
 		return reminders.map((r) => {
 			const picked: Record<string, unknown> = {};

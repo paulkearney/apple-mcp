@@ -171,6 +171,72 @@ async function attemptEagerLoading() {
 // Attempt eager loading first
 attemptEagerLoading();
 
+/** Cap on how many reminders a single tool response inlines. */
+const MAX_REMINDERS_IN_RESPONSE = 50;
+
+interface ReminderLike {
+	name?: string;
+	body?: string;
+	completed?: boolean;
+	dueDate?: string | null;
+	listName?: string;
+}
+
+function formatReminder(reminder: ReminderLike): string {
+	const parts = [
+		`${reminder.completed ? "[x]" : "[ ]"} ${reminder.name || "(untitled)"}`,
+	];
+	if (reminder.listName) parts.push(`list: ${reminder.listName}`);
+	if (reminder.dueDate) parts.push(`due: ${reminder.dueDate}`);
+
+	let line = parts.join(" | ");
+	const notes = (reminder.body || "").trim();
+	if (notes) {
+		line += `\n    ${notes.length > 200 ? `${notes.slice(0, 200)}...` : notes}`;
+	}
+	return line;
+}
+
+function formatReminders(items: unknown[], limit?: number): string {
+	const max = limit && limit > 0 ? limit : MAX_REMINDERS_IN_RESPONSE;
+	const shown = items.slice(0, max);
+	const lines = shown.map((item) => {
+		// listById with `props` projects an arbitrary subset of fields, so
+		// anything that isn't a recognisable reminder is emitted as raw JSON.
+		const candidate = item as ReminderLike;
+		return typeof candidate?.name === "string"
+			? formatReminder(candidate)
+			: JSON.stringify(item);
+	});
+	if (items.length > shown.length) {
+		lines.push(
+			`... and ${items.length - shown.length} more (raise "limit" to see them).`,
+		);
+	}
+	return lines.join("\n");
+}
+
+interface ReminderScope {
+	includeCompleted?: boolean;
+	dueBefore?: string;
+	dueAfter?: string;
+}
+
+/** Qualifier before "reminders", e.g. "incomplete " -- empty when unfiltered. */
+function scopePrefix(scope: ReminderScope): string {
+	return scope.includeCompleted ? "" : "incomplete ";
+}
+
+/** Qualifier after "reminders", e.g. " due before 2026-08-22". */
+function scopeSuffix(scope: ReminderScope): string {
+	if (scope.dueAfter && scope.dueBefore) {
+		return ` due between ${scope.dueAfter} and ${scope.dueBefore}`;
+	}
+	if (scope.dueAfter) return ` due on or after ${scope.dueAfter}`;
+	if (scope.dueBefore) return ` due before ${scope.dueBefore}`;
+	return "";
+}
+
 // Main server object
 let server: Server;
 
@@ -733,25 +799,73 @@ function initServer() {
 						const { operation } = args;
 
 						if (operation === "list") {
-							// List all reminders
+							// List all reminders, optionally narrowed to one list
+							const {
+								listName,
+								limit,
+								dueBefore,
+								dueAfter,
+								includeCompleted,
+							} = args;
+							const scope = { includeCompleted, dueBefore, dueAfter };
 							const lists = await remindersModule.getAllLists();
-							const allReminders = await remindersModule.getAllReminders();
+							const allReminders = await remindersModule.getAllReminders(
+								listName,
+								scope,
+							);
+
+							const sections: string[] = [];
+							if (listName) {
+								sections.push(
+									`Found ${allReminders.length} ${scopePrefix(scope)}reminders in list "${listName}"${scopeSuffix(scope)}.`,
+								);
+								if (allReminders.length === 0) {
+									sections.push(
+										`Available lists: ${lists.map((l) => l.name).join(", ")}`,
+									);
+								}
+							} else {
+								sections.push(
+									`Found ${lists.length} lists and ${allReminders.length} ${scopePrefix(scope)}reminders${scopeSuffix(scope)}.`,
+								);
+							}
+							// Matches first: the list roster is reference material and
+							// would otherwise push the actual results off the top.
+							if (allReminders.length > 0) {
+								sections.push(
+									`Reminders:\n${formatReminders(allReminders, limit)}`,
+								);
+							}
+							if (!listName) {
+								sections.push(
+									`Lists:\n${lists
+										.map((l) => `- ${l.name} (id: ${l.id})`)
+										.join("\n")}`,
+								);
+							}
+
 							return {
 								content: [
 									{
 										type: "text",
-										text: `Found ${lists.length} lists and ${allReminders.length} reminders.`,
+										text: sections.join("\n\n"),
 									},
 								],
-								lists,
-								reminders: allReminders,
 								isError: false,
 							};
 						} else if (operation === "search") {
 							// Search for reminders
-							const { searchText } = args;
+							const {
+								searchText,
+								limit,
+								dueBefore,
+								dueAfter,
+								includeCompleted,
+							} = args;
+							const scope = { includeCompleted, dueBefore, dueAfter };
 							const results = await remindersModule.searchReminders(
 								searchText!,
+								scope,
 							);
 							return {
 								content: [
@@ -759,11 +873,10 @@ function initServer() {
 										type: "text",
 										text:
 											results.length > 0
-												? `Found ${results.length} reminders matching "${searchText}".`
-												: `No reminders found matching "${searchText}".`,
+												? `Found ${results.length} ${scopePrefix(scope)}reminders matching "${searchText}"${scopeSuffix(scope)}.\n\n${formatReminders(results, limit)}`
+												: `No ${scopePrefix(scope)}reminders found matching "${searchText}"${scopeSuffix(scope)}.`,
 									},
 								],
-								reminders: results,
 								isError: false,
 							};
 						} else if (operation === "open") {
@@ -804,10 +917,19 @@ function initServer() {
 							};
 						} else if (operation === "listById") {
 							// Get reminders from a specific list by ID
-							const { listId, props } = args;
+							const {
+								listId,
+								props,
+								limit,
+								dueBefore,
+								dueAfter,
+								includeCompleted,
+							} = args;
+							const scope = { includeCompleted, dueBefore, dueAfter };
 							const results = await remindersModule.getRemindersFromListById(
 								listId!,
 								props,
+								scope,
 							);
 							return {
 								content: [
@@ -815,11 +937,10 @@ function initServer() {
 										type: "text",
 										text:
 											results.length > 0
-												? `Found ${results.length} reminders in list with ID "${listId}".`
-												: `No reminders found in list with ID "${listId}".`,
+												? `Found ${results.length} ${scopePrefix(scope)}reminders in list with ID "${listId}"${scopeSuffix(scope)}.\n\n${formatReminders(results, limit)}`
+												: `No ${scopePrefix(scope)}reminders found in list with ID "${listId}"${scopeSuffix(scope)}.`,
 									},
 								],
-								reminders: results,
 								isError: false,
 							};
 						}
@@ -1401,6 +1522,10 @@ function isRemindersArgs(args: unknown): args is {
 	props?: string[];
 	notes?: string;
 	dueDate?: string;
+	limit?: number;
+	dueBefore?: string;
+	dueAfter?: string;
+	includeCompleted?: boolean;
 } {
 	if (typeof args !== "object" || args === null) {
 		return false;
@@ -1438,6 +1563,26 @@ function isRemindersArgs(args: unknown): args is {
 		(typeof (args as any).listId !== "string" || (args as any).listId === "")
 	) {
 		return false;
+	}
+
+	const { limit } = args as any;
+	if (limit !== undefined && (typeof limit !== "number" || limit <= 0)) {
+		return false;
+	}
+
+	const { includeCompleted } = args as any;
+	if (includeCompleted !== undefined && typeof includeCompleted !== "boolean") {
+		return false;
+	}
+
+	// Reject unparseable bounds here rather than silently ignoring them, which
+	// would return an unfiltered set that looks like a legitimate answer.
+	for (const key of ["dueBefore", "dueAfter"]) {
+		const value = (args as any)[key];
+		if (value === undefined) continue;
+		if (typeof value !== "string" || Number.isNaN(Date.parse(value))) {
+			return false;
+		}
 	}
 
 	return true;
