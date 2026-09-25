@@ -34,11 +34,17 @@ export async function runJxa<T>(script: string, timeoutMs = 60000): Promise<T> {
 	}
 }
 
+export interface Memoized<T> {
+	(): Promise<T>;
+	/** Drops the cached value so the next call re-fetches (use after a write). */
+	reset: () => void;
+}
+
 /** Simple time-boxed memo so repeated tool calls don't re-pay a full bulk fetch. */
-export function memoize<T>(fn: () => Promise<T>, ttlMs: number): () => Promise<T> {
+export function memoize<T>(fn: () => Promise<T>, ttlMs: number): Memoized<T> {
 	let at = 0;
 	let cached: Promise<T> | null = null;
-	return () => {
+	const get = () => {
 		const now = Date.now();
 		if (!cached || now - at > ttlMs) {
 			at = now;
@@ -49,4 +55,8 @@ export function memoize<T>(fn: () => Promise<T>, ttlMs: number): () => Promise<T
 		}
 		return cached;
 	};
+	get.reset = () => {
+		cached = null;
+	};
+	return get;
 }

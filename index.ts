@@ -904,13 +904,19 @@ function initServer() {
 								notes,
 								dueDate,
 							);
+							const details = [`Created reminder "${result.name}" in list "${result.listName}"`];
+							if (result.dueDate) details.push(`due ${result.dueDate}`);
+							if (result.body) details.push("with notes");
+							let text = `${details.join(", ")}.`;
+							if (
+								listName &&
+								listName.trim().toLowerCase() !== result.listName.toLowerCase()
+							) {
+								text += ` No list named "${listName}" exists, so the default list was used.`;
+							}
+							if (result.id) text += ` ID: ${result.id}`;
 							return {
-								content: [
-									{
-										type: "text",
-										text: `Created reminder "${result.name}" ${listName ? `in list "${listName}"` : ""}.`,
-									},
-								],
+								content: [{ type: "text", text }],
 								success: true,
 								reminder: result,
 								isError: false,

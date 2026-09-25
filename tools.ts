@@ -151,7 +151,7 @@ const CONTACTS_TOOL: Tool = {
         },
         listName: {
           type: "string",
-          description: "Name of a reminder list: the list to create the reminder in (create operation), or the list to restrict results to (list operation)"
+          description: "Name of a reminder list: the list to create the reminder in (create operation; falls back to the default list if no list has that name), or the list to restrict results to (list operation)"
         },
         listId: {
           type: "string",

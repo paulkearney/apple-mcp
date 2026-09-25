@@ -270,16 +270,50 @@ end tell`;
 }
 
 /**
- * Create a new reminder (simplified for performance)
+ * Parses a due date supplied by the caller. A bare calendar date (YYYY-MM-DD)
+ * becomes an all-day due date; anything else must parse as a full timestamp.
+ */
+function parseDueDate(
+	dueDate: string,
+): { year: number; month: number; day: number; hour?: number; minute?: number } {
+	const trimmed = dueDate.trim();
+	const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+	if (dateOnly) {
+		const [, y, m, d] = dateOnly;
+		const probe = new Date(Number(y), Number(m) - 1, Number(d));
+		if (probe.getMonth() !== Number(m) - 1 || probe.getDate() !== Number(d)) {
+			throw new Error(`Invalid due date: ${dueDate}`);
+		}
+		return { year: Number(y), month: Number(m), day: Number(d) };
+	}
+	const parsed = new Date(trimmed);
+	if (Number.isNaN(parsed.getTime())) {
+		throw new Error(
+			`Invalid due date: ${dueDate}. Use YYYY-MM-DD or an ISO timestamp such as 2026-09-24T14:00:00`,
+		);
+	}
+	return {
+		year: parsed.getFullYear(),
+		month: parsed.getMonth() + 1,
+		day: parsed.getDate(),
+		hour: parsed.getHours(),
+		minute: parsed.getMinutes(),
+	};
+}
+
+/**
+ * Create a new reminder through EventKit.
  * @param name Name of the reminder
- * @param listName Name of the list to add the reminder to (creates if doesn't exist)
+ * @param listName List to add the reminder to. Falls back to the default
+ *   Reminders list when no list with that name exists.
  * @param notes Optional notes for the reminder
- * @param dueDate Optional due date for the reminder (ISO string)
- * @returns The created reminder
+ * @param dueDate Optional due date: YYYY-MM-DD for an all-day reminder, or an
+ *   ISO timestamp for a timed one (which also gets an alert at that time)
+ * @returns The created reminder, as stored
  */
 async function createReminder(
 	name: string,
-	listName: string = "Reminders",
+	listName?: string,
 	notes?: string,
 	dueDate?: string,
 ): Promise<Reminder> {
@@ -289,51 +323,84 @@ async function createReminder(
 			throw new Error(accessResult.message);
 		}
 
-		// Validate inputs
 		if (!name || name.trim() === "") {
 			throw new Error("Reminder name cannot be empty");
 		}
 
-		const cleanName = name.replace(/\"/g, '\\"');
-		const cleanListName = listName.replace(/\"/g, '\\"');
-		const cleanNotes = notes ? notes.replace(/\"/g, '\\"') : "";
+		const due = dueDate && dueDate.trim() ? parseDueDate(dueDate) : null;
+		const params = {
+			name: name.trim(),
+			listName: listName?.trim() || "",
+			notes: notes ?? "",
+			due,
+		};
 
 		const script = `
-tell application "Reminders"
-    try
-        -- Use first available list (creating/finding lists can be slow)
-        set allLists to lists
-        if (count of allLists) > 0 then
-            set targetList to first item of allLists
-            set listName to name of targetList
+ObjC.import('EventKit');
+ObjC.import('Foundation');
+const p = ${JSON.stringify(params)};
+const store = $.EKEventStore.alloc.init;
+const cals = store.calendarsForEntityType(1);
+const n = parseInt(String(cals.count), 10) || 0;
+let target = null;
+const want = p.listName.toLowerCase();
+for (let i = 0; i < n && want; i++) {
+  const c = cals.objectAtIndex(i);
+  if (String(ObjC.unwrap(c.title) || '').toLowerCase() === want) { target = c; break; }
+}
+const fellBack = !target && !!want;
+if (!target) target = store.defaultCalendarForNewReminders;
+if (!target || target.js === undefined) throw new Error('No Reminders list is available');
+const rem = $.EKReminder.reminderWithEventStore(store);
+rem.calendar = target;
+rem.title = $(p.name);
+if (p.notes) rem.notes = $(p.notes);
+if (p.due) {
+  const comps = $.NSDateComponents.alloc.init;
+  comps.year = p.due.year; comps.month = p.due.month; comps.day = p.due.day;
+  const timed = typeof p.due.hour === 'number';
+  if (timed) { comps.hour = p.due.hour; comps.minute = p.due.minute; comps.second = 0; }
+  rem.dueDateComponents = comps;
+  if (timed) {
+    const when = $.NSCalendar.currentCalendar.dateFromComponents(comps);
+    rem.addAlarm($.EKAlarm.alarmWithAbsoluteDate(when));
+  }
+}
+const err = Ref();
+const ok = store.saveReminderCommitError(rem, true, err);
+if (!ok) {
+  const msg = err[0] && err[0].localizedDescription ? ObjC.unwrap(err[0].localizedDescription) : 'unknown error';
+  throw new Error('EventKit refused to save the reminder: ' + msg);
+}
+const iso = function (d) {
+  try { return d && d.js ? new Date(d.js).toISOString() : null; } catch (e) { return null; }
+};
+JSON.stringify({
+  name: String(ObjC.unwrap(rem.title) || ''),
+  id: String(ObjC.unwrap(rem.calendarItemIdentifier) || ''),
+  body: String(ObjC.unwrap(rem.notes) || ''),
+  completed: false,
+  dueDate: iso(rem.dueDateComponents ? rem.dueDateComponents.date : null),
+  listName: String(ObjC.unwrap(target.title) || ''),
+  creationDate: iso(rem.creationDate),
+  fellBack: fellBack
+});
+`;
 
-            -- Create a simple reminder with just name
-            set newReminder to make new reminder at targetList with properties {name:"${cleanName}"}
-            return "SUCCESS:" & listName
-        else
-            return "ERROR:No lists available"
-        end if
-    on error errorMessage
-        return "ERROR:" & errorMessage
-    end try
-end tell`;
-
-		const result = (await runAppleScript(script)) as string;
-
-		if (result && result.startsWith("SUCCESS:")) {
-			const actualListName = result.replace("SUCCESS:", "");
-
-			return {
-				name: name,
-				id: "created-reminder-id",
-				body: notes || "",
-				completed: false,
-				dueDate: dueDate || null,
-				listName: actualListName,
-			};
-		} else {
-			throw new Error(`Failed to create reminder: ${result}`);
+		const created = await runJxa<Reminder & { fellBack?: boolean }>(script, 30000);
+		if (!created || !created.id) {
+			throw new Error("EventKit returned no reminder after saving");
 		}
+		// The bulk read cache predates this write; drop it so a follow-up
+		// search or list sees the new reminder.
+		loadReminders.reset();
+		const { fellBack, ...reminder } = created;
+		if (fellBack) {
+			console.error(
+				`Reminder list "${listName}" not found; created "${reminder.name}" in "${reminder.listName}" instead`,
+			);
+		}
+		return reminder;
 	} catch (error) {
 		throw new Error(
 			`Failed to create reminder: ${error instanceof Error ? error.message : String(error)}`,
