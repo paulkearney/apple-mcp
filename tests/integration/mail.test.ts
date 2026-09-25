@@ -294,4 +294,48 @@ describe("Mail Integration Tests", () => {
       console.log("✅ Mail access error handling works correctly");
     }, 15000);
   });
+
+  describe("write operations (validation only, no side effects)", () => {
+    const missing = "definitely-not-a-real-account-" + Date.now();
+
+    it("moveMail should reject a nonexistent account", async () => {
+      await expect(
+        mailModule.moveMail({
+          account: missing,
+          subject: "x",
+          sender: "y",
+          destinationMailbox: "Archive",
+        }),
+      ).rejects.toThrow(/No such account/);
+    }, 30000);
+
+    it("moveMail should reject missing required fields", async () => {
+      await expect(
+        mailModule.moveMail({ account: "a", subject: "", sender: "y", destinationMailbox: "z" }),
+      ).rejects.toThrow(/Subject is required/);
+      await expect(
+        mailModule.moveMail({ account: "a", subject: "x", sender: "y", destinationMailbox: " " }),
+      ).rejects.toThrow(/Destination mailbox is required/);
+    }, 30000);
+
+    it("createMailbox should reject a nonexistent account", async () => {
+      await expect(mailModule.createMailbox(missing, "Foo/Bar")).rejects.toThrow(/No such account/);
+    }, 30000);
+
+    it("createMailbox should reject an empty path", async () => {
+      await expect(mailModule.createMailbox("a", " / ")).rejects.toThrow(/path is required/);
+    }, 30000);
+
+    it("saveDraft should reject a nonexistent account", async () => {
+      await expect(
+        mailModule.saveDraft(missing, "test@example.com", "subject", "body"),
+      ).rejects.toThrow();
+    }, 30000);
+
+    it("saveDraft should reject missing required fields", async () => {
+      await expect(mailModule.saveDraft("a", "", "subject", "body")).rejects.toThrow(/To address/);
+      await expect(mailModule.saveDraft("a", "t@x.com", "", "body")).rejects.toThrow(/Subject/);
+      await expect(mailModule.saveDraft("a", "t@x.com", "s", " ")).rejects.toThrow(/body/);
+    }, 30000);
+  });
 });

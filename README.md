@@ -44,6 +44,7 @@ Click below for one click install with `.dxt`
 
 - Send emails with attachments, CC, BCC - the whole professional shebang
 - Search through your email chaos with surgical precision
+- Move a message into a folder, create nested folders like `Clients/Acme`, and save drafts
 - Schedule emails for later (because 3 AM ideas shouldn't be sent at 3 AM)
 - Check unread counts (prepare for existential dread)
 

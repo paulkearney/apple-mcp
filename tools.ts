@@ -80,22 +80,39 @@ const CONTACTS_TOOL: Tool = {
   
   const MAIL_TOOL: Tool = {
     name: "mail",
-    description: "Interact with Apple Mail app - read unread emails, search emails, and send emails",
+    description: "Interact with Apple Mail app - read unread emails, search emails, send emails, " +
+      "move a message to a mailbox, create mailboxes, and save drafts",
     inputSchema: {
       type: "object",
       properties: {
         operation: {
           type: "string",
-          description: "Operation to perform: 'unread', 'search', 'send', 'mailboxes', 'accounts', or 'latest'",
-          enum: ["unread", "search", "send", "mailboxes", "accounts", "latest"]
+          description: "Operation to perform: 'unread', 'search', 'send', 'mailboxes', 'accounts', " +
+            "'latest', 'move', 'createMailbox', or 'saveDraft'",
+          enum: ["unread", "search", "send", "mailboxes", "accounts", "latest", "move",
+            "createMailbox", "saveDraft"]
         },
         account: {
           type: "string",
-          description: "Email account to use (optional - if not provided, searches across all accounts)"
+          description: "Email account to use (optional for reads - if not provided, searches across " +
+            "all accounts; required for move, createMailbox and saveDraft)"
         },
         mailbox: {
           type: "string",
-          description: "Mailbox to use (optional - if not provided, uses inbox or searches across all mailboxes)"
+          description: "Mailbox path, e.g. 'Clients/Acme' (for createMailbox: the mailbox to create; " +
+            "for move: the mailbox to search, defaulting to the inbox; otherwise optional)"
+        },
+        destinationMailbox: {
+          type: "string",
+          description: "Mailbox path to move the message into (required for move operation)"
+        },
+        sender: {
+          type: "string",
+          description: "Sender name or address the message must match (required for move operation)"
+        },
+        isRead: {
+          type: "boolean",
+          description: "Read status the message must match: false for unread (for move operation)"
         },
         limit: {
           type: "number",
@@ -107,23 +124,23 @@ const CONTACTS_TOOL: Tool = {
         },
         to: {
           type: "string",
-          description: "Recipient email address (required for send operation)"
+          description: "Recipient email address (required for send and saveDraft operations)"
         },
         subject: {
           type: "string",
-          description: "Email subject (required for send operation)"
+          description: "Email subject (required for send, saveDraft and move operations)"
         },
         body: {
           type: "string",
-          description: "Email body content (required for send operation)"
+          description: "Email body content (required for send and saveDraft operations)"
         },
         cc: {
           type: "string",
-          description: "CC email address (optional for send operation)"
+          description: "CC email address (optional for send and saveDraft operations)"
         },
         bcc: {
           type: "string",
-          description: "BCC email address (optional for send operation)"
+          description: "BCC email address (optional for send and saveDraft operations)"
         }
       },
       required: ["operation"]
@@ -166,11 +183,11 @@ const CONTACTS_TOOL: Tool = {
         },
         notes: {
           type: "string",
-          description: "Additional notes for the reminder (optional for create operation)"
+          description: "Notes body for the reminder; newlines are preserved (optional for create operation)"
         },
         dueDate: {
           type: "string",
-          description: "Due date for the reminder in ISO format (optional for create operation)"
+          description: "Due date for the reminder (optional for create operation). Use YYYY-MM-DD for an all-day due date, or a local ISO timestamp such as 2026-09-24T14:30:00 for a specific time, which also sets an alert at that time"
         },
         limit: {
           type: "number",

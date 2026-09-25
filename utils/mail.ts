@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { runAppleScript } from "run-applescript";
 import { runJxa } from "./jxa";
 
@@ -39,6 +40,85 @@ interface EmailMessage {
 function jsLit(s: string): string {
 	return JSON.stringify(String(s));
 }
+
+/** Escapes a string for embedding in a double-quoted AppleScript literal. */
+function asLit(s: string): string {
+	return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/**
+ * JXA helpers shared by the mailbox-addressed operations (move, createMailbox).
+ *
+ * Mail flattens `account.mailboxes` across every nesting depth (a folder
+ * "Clients/Regus/Old" shows up as three entries named "Clients", "Regus" and
+ * "Old"), while `mailbox.mailboxes` lists only direct children. Paths are
+ * therefore resolved by matching the first segment at the top level and each
+ * later segment among the previous mailbox's children. Matching is
+ * case-insensitive so "inbox" finds "INBOX".
+ */
+const MAILBOX_HELPERS = `
+function findAccount(M, name) {
+  const accts = M.accounts;
+  const names = accts.name();
+  for (let i = 0; i < names.length; i++) {
+    if (String(names[i]) === name) return accts[i];
+  }
+  throw new Error("No such account: " + name);
+}
+// Reading a mailbox-only property off an account container throws, which is
+// the only reliable way to tell "top-level mailbox" from "nested mailbox".
+function isMailbox(x) {
+  try { x.unreadCount(); return true; } catch (e) { return false; }
+}
+function splitPath(path) {
+  return String(path).split("/").map(function (s) { return s.trim(); }).filter(Boolean);
+}
+function lower(s) { return String(s).toLowerCase(); }
+// Returns the mailbox at \`path\` inside \`acct\`, or null if absent. The
+// candidates are the mailboxes named like the last segment; each one's
+// container chain is walked upwards against the remaining segments and must
+// end at the account. Walking up (not down from the account) matters because
+// Mail does not enumerate an IMAP parent folder that exists only as a path
+// prefix, even though a child's container() still returns it. With
+// \`lenient\`, a path that matches the tail of exactly one deeper path (e.g.
+// "Regus/Old" for "Clients/Regus/Old") resolves as well.
+function resolveMailbox(acct, path, lenient) {
+  const segs = splitPath(path).map(lower);
+  if (segs.length === 0) throw new Error("Mailbox path is empty");
+  const all = acct.mailboxes;
+  const names = all.name();
+  const leaf = segs[segs.length - 1];
+  const exact = [];
+  const partial = [];
+  for (let i = 0; i < names.length; i++) {
+    if (lower(names[i]) !== leaf) continue;
+    let cur = all[i];
+    let k = segs.length - 1;
+    let matched = true;
+    while (k > 0) {
+      let parent = null;
+      try { parent = cur.container(); } catch (e) { parent = null; }
+      if (!parent || !isMailbox(parent) || lower(parent.name()) !== segs[k - 1]) {
+        matched = false;
+        break;
+      }
+      cur = parent;
+      k--;
+    }
+    if (!matched) continue;
+    let top = null;
+    try { top = cur.container(); } catch (e) { top = null; }
+    if (top && isMailbox(top)) partial.push(i); else exact.push(i);
+  }
+  if (exact.length > 0) return all[exact[0]];
+  if (lenient && partial.length === 1) return all[partial[0]];
+  if (lenient && partial.length > 1) {
+    throw new Error("Mailbox path '" + path + "' is ambiguous in account "
+      + String(acct.name()) + "; give its full path from the top level");
+  }
+  return null;
+}
+`;
 
 async function checkMailAccess(): Promise<boolean> {
 	try {
@@ -303,10 +383,227 @@ end tell`;
 	}
 }
 
+interface MoveMailOptions {
+	account: string;
+	subject: string;
+	sender: string;
+	/** When set, only a message with this read status matches. */
+	isRead?: boolean;
+	destinationMailbox: string;
+	/** Mailbox path to search; defaults to the account's inbox. */
+	sourceMailbox?: string;
+}
+
+interface MoveMailResult {
+	subject: string;
+	sender: string;
+	dateSent: string;
+	isRead: boolean;
+	/** Number of messages that matched; the newest one was moved. */
+	matched: number;
+	source: string;
+	destination: string;
+}
+
+/**
+ * Moves the newest message in the account's inbox (or `sourceMailbox`) whose
+ * subject equals `subject`, whose sender contains `sender`, and whose read
+ * status matches `isRead` when given, into `destinationMailbox`.
+ */
+async function moveMail(opts: MoveMailOptions): Promise<MoveMailResult> {
+	const access = await requestMailAccess();
+	if (!access.hasAccess) throw new Error(access.message);
+	if (!opts.account || !opts.account.trim()) throw new Error("Account is required");
+	if (!opts.subject || !opts.subject.trim()) throw new Error("Subject is required");
+	if (!opts.sender || !opts.sender.trim()) throw new Error("Sender is required");
+	if (!opts.destinationMailbox || !opts.destinationMailbox.trim()) {
+		throw new Error("Destination mailbox is required");
+	}
+	const source = (opts.sourceMailbox || "INBOX").trim();
+	const script = `
+${MAILBOX_HELPERS}
+const M = Application("Mail");
+const acct = findAccount(M, ${jsLit(opts.account)});
+const src = resolveMailbox(acct, ${jsLit(source)}, true);
+if (!src) {
+  throw new Error("No mailbox " + ${jsLit(source)} + " in account " + ${jsLit(opts.account)});
+}
+const dest = resolveMailbox(acct, ${jsLit(opts.destinationMailbox.trim())}, true);
+if (!dest) {
+  throw new Error("No mailbox " + ${jsLit(opts.destinationMailbox.trim())} + " in account "
+    + ${jsLit(opts.account)} + " (use createMailbox first)");
+}
+// Bulk property reads, never a whose() clause: see collectorScript.
+const msgs = src.messages;
+const read = msgs.readStatus();
+const subj = msgs.subject();
+const send = msgs.sender();
+const date = msgs.dateSent();
+const wantSubj = ${jsLit(opts.subject.trim().toLowerCase())};
+const wantSender = ${jsLit(opts.sender.trim().toLowerCase())};
+const wantRead = ${opts.isRead === undefined ? "null" : String(opts.isRead)};
+const matches = [];
+for (let i = 0; i < read.length; i++) {
+  if (String(subj[i] || "").trim().toLowerCase() !== wantSubj) continue;
+  if (String(send[i] || "").toLowerCase().indexOf(wantSender) === -1) continue;
+  if (wantRead !== null && (read[i] === true) !== wantRead) continue;
+  matches.push(i);
+}
+if (matches.length === 0) {
+  throw new Error("No " + (wantRead === null ? "" : wantRead ? "read " : "unread ")
+    + "message from '" + ${jsLit(opts.sender)} + "' with subject '" + ${jsLit(opts.subject)}
+    + "' in " + ${jsLit(source)} + " of account " + ${jsLit(opts.account)});
+}
+matches.sort(function (a, b) { return (date[b] || 0) - (date[a] || 0); });
+const i = matches[0];
+const result = {
+  subject: String(subj[i] || ""),
+  sender: String(send[i] || ""),
+  dateSent: String(date[i] || ""),
+  isRead: read[i] === true,
+  matched: matches.length,
+  source: ${jsLit(source)},
+  destination: ${jsLit(opts.destinationMailbox.trim())}
+};
+M.move(msgs[i], { to: dest });
+JSON.stringify(result);
+`;
+	try {
+		return await runJxa<MoveMailResult>(script, CONFIG.TIMEOUT_MS);
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		console.error(`Error moving email: ${msg}`);
+		throw new Error(`Error moving email: ${msg}`);
+	}
+}
+
+interface CreateMailboxResult {
+	account: string;
+	path: string;
+	/** False when the mailbox already existed. */
+	created: boolean;
+	/** Set when Mail accepted the request but the result is not what was asked. */
+	note?: string;
+}
+
+/**
+ * Creates the mailbox at a slash-separated `path` (e.g. "Clients/Acme") in
+ * `account`, including any missing parents.
+ *
+ * Mail's `make new mailbox` accepts the whole path as the name, and it is the
+ * only form Mail honours: making a mailbox inside another mailbox fails with
+ * "AppleEvent handler failed" on local, iCloud and Exchange accounts alike.
+ * Server-backed accounts create asynchronously, so the result is polled for.
+ * Exchange accounts place the new mailbox under the right parent but keep the
+ * literal slash path as its name; that case is reported in `note`.
+ */
+async function createMailbox(account: string, path: string): Promise<CreateMailboxResult> {
+	const access = await requestMailAccess();
+	if (!access.hasAccess) throw new Error(access.message);
+	if (!account || !account.trim()) throw new Error("Account is required");
+	const segments = (path || "")
+		.split("/")
+		.map((s) => s.trim())
+		.filter(Boolean);
+	if (segments.length === 0) throw new Error("Mailbox path is required");
+	const normalized = segments.join("/");
+	const script = `
+${MAILBOX_HELPERS}
+const M = Application("Mail");
+const acct = findAccount(M, ${jsLit(account)});
+const path = ${jsLit(normalized)};
+const result = { account: ${jsLit(account)}, path: path, created: false };
+if (!resolveMailbox(acct, path, false)) {
+  acct.mailboxes.push(M.Mailbox({ name: path }));
+  result.created = true;
+  let found = null;
+  for (let t = 0; t < 20 && !found; t++) {
+    delay(0.5);
+    found = resolveMailbox(acct, path, false);
+  }
+  if (!found) {
+    const names = acct.mailboxes.name();
+    let literal = false;
+    for (let i = 0; i < names.length; i++) {
+      if (String(names[i]) === path) { literal = true; break; }
+    }
+    result.note = literal
+      ? "This account kept the literal name '" + path + "' for the new mailbox instead of "
+        + "nesting it; rename it in Mail if needed"
+      : "Mail accepted the request but the mailbox is not visible yet; "
+        + "it may take a moment to sync";
+  }
+}
+JSON.stringify(result);
+`;
+	try {
+		return await runJxa<CreateMailboxResult>(script, CONFIG.TIMEOUT_MS);
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		console.error(`Error creating mailbox: ${msg}`);
+		throw new Error(`Error creating mailbox: ${msg}`);
+	}
+}
+
+/**
+ * Saves a new message to the Drafts mailbox of `account` without sending it.
+ * The sender is set from the account so Mail files the draft under it.
+ */
+async function saveDraft(
+	account: string,
+	to: string,
+	subject: string,
+	body: string,
+	cc?: string,
+	bcc?: string,
+): Promise<string> {
+	const access = await requestMailAccess();
+	if (!access.hasAccess) throw new Error(access.message);
+	if (!account || !account.trim()) throw new Error("Account is required");
+	if (!to || !to.trim()) throw new Error("To address is required");
+	if (!subject || !subject.trim()) throw new Error("Subject is required");
+	if (!body || !body.trim()) throw new Error("Email body is required");
+
+	const tmpFile = `/tmp/email-draft-${Date.now()}.txt`;
+	fs.writeFileSync(tmpFile, body.trim(), "utf8");
+
+	const script = `
+tell application "Mail"
+    set theAccount to account "${asLit(account)}"
+    set acctAddresses to email addresses of theAccount
+    if (count of acctAddresses) is 0 then error "Account has no email address"
+    set senderLine to (full name of theAccount) & " <" & (item 1 of acctAddresses) & ">"
+    set emailBody to read file POSIX file "${tmpFile}" as «class utf8»
+    set newMessage to make new outgoing message with properties {sender:senderLine, subject:"${asLit(subject)}", content:emailBody, visible:false}
+    tell newMessage
+        make new to recipient with properties {address:"${asLit(to)}"}
+        ${cc ? `make new cc recipient with properties {address:"${asLit(cc)}"}` : ""}
+        ${bcc ? `make new bcc recipient with properties {address:"${asLit(bcc)}"}` : ""}
+    end tell
+    save newMessage
+    return "SUCCESS"
+end tell`;
+
+	try {
+		const result = (await runAppleScript(script)) as string;
+		if (result !== "SUCCESS") throw new Error("Failed to save draft");
+		return `Draft to ${to} with subject "${subject}" saved in account "${account}"`;
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		console.error(`Error saving draft: ${msg}`);
+		throw new Error(`Error saving draft: ${msg}`);
+	} finally {
+		try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
+	}
+}
+
 export default {
 	getUnreadMails,
 	searchMails,
 	sendMail,
+	moveMail,
+	createMailbox,
+	saveDraft,
 	getMailboxes,
 	getAccounts,
 	getMailboxesForAccount,

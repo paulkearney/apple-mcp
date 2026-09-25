@@ -771,6 +771,79 @@ function initServer() {
 								};
 							}
 
+							case "move": {
+								if (!args.account || !args.subject || !args.sender || !args.destinationMailbox) {
+									throw new Error(
+										"Account, subject, sender and destinationMailbox are required for move operation",
+									);
+								}
+								const moved = await mailModule.moveMail({
+									account: args.account,
+									subject: args.subject,
+									sender: args.sender,
+									isRead: args.isRead,
+									destinationMailbox: args.destinationMailbox,
+									sourceMailbox: args.mailbox,
+								});
+								const extra =
+									moved.matched > 1
+										? `\n(${moved.matched} messages matched; the newest was moved)`
+										: "";
+								return {
+									content: [
+										{
+											type: "text",
+											text:
+												`Moved message to "${moved.destination}" in account "${args.account}":\n` +
+												`[${moved.dateSent}] From: ${moved.sender}\nSubject: ${moved.subject}${extra}`,
+										},
+									],
+									isError: false,
+								};
+							}
+
+							case "createMailbox": {
+								if (!args.account || !args.mailbox) {
+									throw new Error(
+										"Account and mailbox path are required for createMailbox operation",
+									);
+								}
+								const created = await mailModule.createMailbox(args.account, args.mailbox);
+								return {
+									content: [
+										{
+											type: "text",
+											text:
+												(created.created
+													? `Created mailbox "${created.path}" in account "${created.account}"`
+													: `Mailbox "${created.path}" already exists in account "${created.account}"`) +
+												(created.note ? `\nNote: ${created.note}` : ""),
+										},
+									],
+									isError: false,
+								};
+							}
+
+							case "saveDraft": {
+								if (!args.account || !args.to || !args.subject || !args.body) {
+									throw new Error(
+										"Account, recipient (to), subject, and body are required for saveDraft operation",
+									);
+								}
+								const result = await mailModule.saveDraft(
+									args.account,
+									args.to,
+									args.subject,
+									args.body,
+									args.cc,
+									args.bcc,
+								);
+								return {
+									content: [{ type: "text", text: result }],
+									isError: false,
+								};
+							}
+
 							default:
 								throw new Error(`Unknown operation: ${args.operation}`);
 						}
@@ -1449,10 +1522,25 @@ function isMessagesArgs(args: unknown): args is {
 	return true;
 }
 
+const MAIL_OPERATIONS = [
+	"unread",
+	"search",
+	"send",
+	"mailboxes",
+	"accounts",
+	"latest",
+	"move",
+	"createMailbox",
+	"saveDraft",
+] as const;
+
 function isMailArgs(args: unknown): args is {
-	operation: "unread" | "search" | "send" | "mailboxes" | "accounts" | "latest";
+	operation: (typeof MAIL_OPERATIONS)[number];
 	account?: string;
 	mailbox?: string;
+	destinationMailbox?: string;
+	sender?: string;
+	isRead?: boolean;
 	limit?: number;
 	searchTerm?: string;
 	to?: string;
@@ -1467,6 +1555,9 @@ function isMailArgs(args: unknown): args is {
 		operation,
 		account,
 		mailbox,
+		destinationMailbox,
+		sender,
+		isRead,
 		limit,
 		searchTerm,
 		to,
@@ -1476,12 +1567,7 @@ function isMailArgs(args: unknown): args is {
 		bcc,
 	} = args as any;
 
-	if (
-		!operation ||
-		!["unread", "search", "send", "mailboxes", "accounts", "latest"].includes(
-			operation,
-		)
-	) {
+	if (!operation || !MAIL_OPERATIONS.includes(operation)) {
 		return false;
 	}
 
@@ -1501,6 +1587,36 @@ function isMailArgs(args: unknown): args is {
 			)
 				return false;
 			break;
+		case "saveDraft":
+			if (
+				!account ||
+				typeof account !== "string" ||
+				!to ||
+				typeof to !== "string" ||
+				!subject ||
+				typeof subject !== "string" ||
+				!body ||
+				typeof body !== "string"
+			)
+				return false;
+			break;
+		case "move":
+			if (
+				!account ||
+				typeof account !== "string" ||
+				!subject ||
+				typeof subject !== "string" ||
+				!sender ||
+				typeof sender !== "string" ||
+				!destinationMailbox ||
+				typeof destinationMailbox !== "string"
+			)
+				return false;
+			break;
+		case "createMailbox":
+			if (!account || typeof account !== "string" || !mailbox || typeof mailbox !== "string")
+				return false;
+			break;
 		case "unread":
 		case "mailboxes":
 		case "accounts":
@@ -1512,6 +1628,9 @@ function isMailArgs(args: unknown): args is {
 	// Validate field types if present
 	if (account && typeof account !== "string") return false;
 	if (mailbox && typeof mailbox !== "string") return false;
+	if (destinationMailbox && typeof destinationMailbox !== "string") return false;
+	if (sender && typeof sender !== "string") return false;
+	if (isRead !== undefined && typeof isRead !== "boolean") return false;
 	if (limit && typeof limit !== "number") return false;
 	if (cc && typeof cc !== "string") return false;
 	if (bcc && typeof bcc !== "string") return false;
