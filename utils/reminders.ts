@@ -302,6 +302,51 @@ function parseDueDate(
 }
 
 /**
+ * Makes sure this process has EventKit access to Reminders, asking if needed.
+ *
+ * Same trap calendar.ts documents: an unauthorized EKEventStore returns zero
+ * reminder lists without ever prompting, which looks identical to "no data".
+ * macOS only lists an app under Privacy & Security > Reminders after it has
+ * asked, so without this request access can never be granted.
+ */
+let remindersAccessGranted = false;
+async function ensureRemindersAccess(): Promise<void> {
+	if (remindersAccessGranted) return;
+	const status = await runJxa<number>(
+		`ObjC.import('EventKit');
+ObjC.import('Foundation');
+// EKAuthorizationStatus: 0 notDetermined, 1 restricted, 2 denied,
+// 3 fullAccess (authorized), 4 writeOnly
+let s = parseInt(String($.EKEventStore.authorizationStatusForEntityType(1)), 10);
+if (s !== 3) {
+  const store = $.EKEventStore.alloc.init;
+  let done = false;
+  if (typeof store.requestFullAccessToRemindersWithCompletion === 'function') {
+    store.requestFullAccessToRemindersWithCompletion(function (g, err) { done = true; });
+  } else {
+    store.requestAccessToEntityTypeCompletion(1, function (g, err) { done = true; });
+  }
+  const deadline = $.NSDate.dateWithTimeIntervalSinceNow(45);
+  while (!done && $.NSDate.date.compare(deadline) < 0) {
+    $.NSRunLoop.currentRunLoop.runModeBeforeDate($.NSDefaultRunLoopMode, $.NSDate.dateWithTimeIntervalSinceNow(0.05));
+  }
+  s = parseInt(String($.EKEventStore.authorizationStatusForEntityType(1)), 10);
+}
+JSON.stringify(s);`,
+		60000,
+	);
+	if (status === 3) {
+		remindersAccessGranted = true;
+		return;
+	}
+	throw new Error(
+		`Reminders full access not granted (EKAuthorizationStatus ${status}). ` +
+			"Allow Full Access when prompted, or if it was denied before, run " +
+			"`tccutil reset Reminders com.anthropic.claudefordesktop`, restart Claude and retry.",
+	);
+}
+
+/**
  * Create a new reminder through EventKit.
  * @param name Name of the reminder
  * @param listName List to add the reminder to. Falls back to the default
@@ -387,6 +432,7 @@ JSON.stringify({
 });
 `;
 
+		await ensureRemindersAccess();
 		const created = await runJxa<Reminder & { fellBack?: boolean }>(script, 30000);
 		if (!created || !created.id) {
 			throw new Error("EventKit returned no reminder after saving");
@@ -551,12 +597,16 @@ JSON.stringify(res);
 `;
 
 const loadReminders = memoize<Reminder[]>(
-	async () => await runJxa<Reminder[]>(EK_REMINDERS, 120000),
+	async () => {
+		await ensureRemindersAccess();
+		return await runJxa<Reminder[]>(EK_REMINDERS, 120000);
+	},
 	30000,
 );
 
 async function getAllListsFast(): Promise<ReminderList[]> {
 	try {
+		await ensureRemindersAccess();
 		const script = `
 ObjC.import('EventKit');
 const store = $.EKEventStore.alloc.init;
