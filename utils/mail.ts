@@ -19,21 +19,45 @@ import { runJxa } from "./jxa";
 
 const CONFIG = {
 	MAX_EMAILS: 20,
+	// Listings without bodies cost one bulk read plus two cheap lookups per
+	// message, so they can return far more than the with-content cap.
+	MAX_EMAILS_NO_CONTENT: 100,
 	MAX_CONTENT_PREVIEW: 300,
 	// Message bodies cost ~5s each over Exchange, so a 10-message listing can
 	// blow past the MCP client's own request timeout. Bound the body fetching
 	// and mark whatever we had to skip, rather than returning nothing at all.
 	CONTENT_BUDGET_SECS: 15,
 	TIMEOUT_MS: 120000,
+	// Full-body reads (the `read` operation) fetch one message at a time, so they
+	// can afford a much larger cap than the listing preview.
+	READ_DEFAULT_CHARS: 8000,
+	READ_MAX_CHARS: 50000,
 };
 
-interface EmailMessage {
+export interface EmailMessage {
 	subject: string;
 	sender: string;
 	dateSent: string;
 	content: string;
 	isRead: boolean;
 	mailbox: string;
+	/** Name of the Mail account the message belongs to ("" if Mail wouldn't say). */
+	account: string;
+	/** Mail's message id: pass it to `read` or `move` to address this exact message. */
+	id: number | null;
+}
+
+export interface MailAccount {
+	name: string;
+	emailAddresses: string[];
+}
+
+export interface FullEmailMessage extends EmailMessage {
+	to: string[];
+	cc: string[];
+	replyTo: string;
+	/** True when the body was cut at `maxChars`. */
+	truncated: boolean;
 }
 
 /** Escapes a string for embedding in a JXA source literal. */
@@ -150,31 +174,33 @@ async function requestMailAccess(): Promise<{ hasAccess: boolean; message: strin
 /**
  * Shared collector: bulk-reads metadata for the inbox, selects indices with
  * `pick`, then fetches content only for the messages actually returned.
+ *
+ * Every returned message carries its account name and Mail message id, so a
+ * caller working from the unified inbox can still tell accounts apart and can
+ * address one exact message later (`read`, `move`) without matching on text.
+ * With `includeContent` false no bodies are fetched at all, which keeps a
+ * 20-message listing to a couple of seconds even over Exchange.
  */
-function collectorScript(pickBody: string, limit: number, account?: string): string {
-	// Scoping to one account uses that account's INBOX rather than the unified
-	// inbox. Never use a `whose(...)` clause here: Mail evaluates it per message
-	// (37s on one 68k mailbox), which is what wedged Mail.app before.
+function collectorScript(
+	pickBody: string,
+	limit: number,
+	account?: string,
+	includeContent = true,
+): string {
+	// Scoping to one account uses that account's top-level INBOX rather than the
+	// unified inbox. Never use a `whose(...)` clause here: Mail evaluates it per
+	// message (37s on one 68k mailbox), which is what wedged Mail.app before.
 	const boxExpr = account
 		? `(function () {
-             const accts = M.accounts;
-             const names = accts.name();
-             let acct = null;
-             for (let i = 0; i < names.length; i++) {
-               if (String(names[i]) === ${jsLit(account)}) { acct = accts[i]; break; }
-             }
-             if (!acct) throw new Error("No such account: " + ${jsLit(account)});
-             const boxes = acct.mailboxes;
-             const bn = boxes.name();
-             for (let i = 0; i < bn.length; i++) {
-               const nm = String(bn[i]).toLowerCase();
-               if (nm === "inbox") return boxes[i];
-             }
-             return acct.mailboxes[0];
+             const acct = findAccount(M, ${jsLit(account)});
+             const inbox = resolveMailbox(acct, "INBOX", false);
+             if (!inbox) throw new Error("No inbox in account " + ${jsLit(account)});
+             return inbox;
            })()`
 		: "M.inbox";
 	return `
 ObjC.import('Foundation');
+${MAILBOX_HELPERS}
 const M = Application("Mail");
 const box = ${boxExpr};
 const msgs = box.messages;
@@ -192,19 +218,30 @@ ${pickBody}
 // Sort by date descending before truncating so "latest"/"unread" mean it.
 picked.sort(function (a, b) { return (date[b] || 0) - (date[a] || 0); });
 const out = [];
+const fixedAccount = ${account ? jsLit(account) : '""'};
 const contentDeadline = $.NSDate.dateWithTimeIntervalSinceNow(${CONFIG.CONTENT_BUDGET_SECS});
 for (let k = 0; k < picked.length && k < ${limit}; k++) {
   const i = picked[k];
+  const msg = msgs[i];
   let content = "";
-  if ($.NSDate.date.compare(contentDeadline) >= 0) {
-    content = "[Body not fetched: content budget exceeded]";
-  } else {
-    try {
-      content = String(msgs[i].content() || "");
-    } catch (e) { content = "[Content not available]"; }
+  if (${includeContent ? "true" : "false"}) {
+    if ($.NSDate.date.compare(contentDeadline) >= 0) {
+      content = "[Body not fetched: content budget exceeded; use the read operation with this id]";
+    } else {
+      try {
+        content = String(msg.content() || "");
+      } catch (e) { content = "[Content not available]"; }
+    }
+    if (content.length > ${CONFIG.MAX_CONTENT_PREVIEW}) {
+      content = content.slice(0, ${CONFIG.MAX_CONTENT_PREVIEW}) + "...";
+    }
   }
-  if (content.length > ${CONFIG.MAX_CONTENT_PREVIEW}) {
-    content = content.slice(0, ${CONFIG.MAX_CONTENT_PREVIEW}) + "...";
+  // Two cheap per-message lookups, only for the messages actually returned.
+  let id = null;
+  try { id = msg.id(); } catch (e) { id = null; }
+  let acctName = fixedAccount;
+  if (!acctName) {
+    try { acctName = String(msg.mailbox().account().name()); } catch (e) { acctName = ""; }
   }
   out.push({
     subject: String(subj[i] || "(no subject)"),
@@ -212,35 +249,53 @@ for (let k = 0; k < picked.length && k < ${limit}; k++) {
     dateSent: String(date[i] || ""),
     content: content,
     isRead: read[i] === true,
-    mailbox: ${account ? JSON.stringify(account + " - Inbox") : '"Inbox"'}
+    mailbox: "Inbox",
+    account: acctName,
+    id: id
   });
 }
 JSON.stringify(out);
 `;
 }
 
-async function getUnreadMails(limit = 10, account?: string): Promise<EmailMessage[]> {
+/**
+ * Read failures are thrown, not swallowed: an empty array used to be returned,
+ * which the caller reported as "No unread emails found" when Mail had in fact
+ * timed out. Callers turn the thrown error into an isError tool result.
+ */
+async function getUnreadMails(
+	limit = 10,
+	account?: string,
+	includeContent = true,
+): Promise<EmailMessage[]> {
 	try {
 		const access = await requestMailAccess();
 		if (!access.hasAccess) throw new Error(access.message);
-		const max = Math.min(limit, CONFIG.MAX_EMAILS);
+		const max = Math.min(limit, includeContent ? CONFIG.MAX_EMAILS : CONFIG.MAX_EMAILS_NO_CONTENT);
 		// Inbox is ordered newest-first, so a forward scan yields newest unread.
 		const pick = `for (let i = 0; i < n; i++) { if (read[i] === false) picked.push(i); }`;
-		return await runJxa<EmailMessage[]>(collectorScript(pick, max, account), CONFIG.TIMEOUT_MS);
-	} catch (error) {
-		console.error(
-			`Error getting unread emails: ${error instanceof Error ? error.message : String(error)}`,
+		return await runJxa<EmailMessage[]>(
+			collectorScript(pick, max, account, includeContent),
+			CONFIG.TIMEOUT_MS,
 		);
-		return [];
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		console.error(`Error getting unread emails: ${msg}`);
+		throw new Error(`Error getting unread emails: ${msg}`);
 	}
 }
 
-async function searchMails(searchTerm: string, limit = 10, account?: string): Promise<EmailMessage[]> {
+async function searchMails(
+	searchTerm: string,
+	limit = 10,
+	account?: string,
+	includeContent = true,
+): Promise<EmailMessage[]> {
 	try {
 		const access = await requestMailAccess();
 		if (!access.hasAccess) throw new Error(access.message);
 		if (!searchTerm || !searchTerm.trim()) return [];
-		const max = Math.min(limit, CONFIG.MAX_EMAILS);
+		const max = Math.min(limit, includeContent ? CONFIG.MAX_EMAILS : CONFIG.MAX_EMAILS_NO_CONTENT);
 		const pick = `
 const q = ${jsLit(searchTerm.toLowerCase().trim())};
 for (let i = 0; i < n; i++) {
@@ -248,27 +303,146 @@ for (let i = 0; i < n; i++) {
   const f = String(send[i] || "").toLowerCase();
   if (s.indexOf(q) !== -1 || f.indexOf(q) !== -1) picked.push(i);
 }`;
-		return await runJxa<EmailMessage[]>(collectorScript(pick, max, account), CONFIG.TIMEOUT_MS);
-	} catch (error) {
-		console.error(
-			`Error searching emails: ${error instanceof Error ? error.message : String(error)}`,
+		return await runJxa<EmailMessage[]>(
+			collectorScript(pick, max, account, includeContent),
+			CONFIG.TIMEOUT_MS,
 		);
-		return [];
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		console.error(`Error searching emails: ${msg}`);
+		throw new Error(`Error searching emails: ${msg}`);
 	}
 }
 
-async function getLatestMails(account?: string, limit = 10): Promise<EmailMessage[]> {
+async function getLatestMails(
+	account?: string,
+	limit = 10,
+	includeContent = true,
+): Promise<EmailMessage[]> {
 	try {
 		const access = await requestMailAccess();
 		if (!access.hasAccess) throw new Error(access.message);
-		const max = Math.min(limit, CONFIG.MAX_EMAILS);
+		const max = Math.min(limit, includeContent ? CONFIG.MAX_EMAILS : CONFIG.MAX_EMAILS_NO_CONTENT);
 		const pick = `for (let i = 0; i < n; i++) { picked.push(i); }`;
-		return await runJxa<EmailMessage[]>(collectorScript(pick, max, account), CONFIG.TIMEOUT_MS);
-	} catch (error) {
-		console.error(
-			`Error getting latest emails: ${error instanceof Error ? error.message : String(error)}`,
+		return await runJxa<EmailMessage[]>(
+			collectorScript(pick, max, account, includeContent),
+			CONFIG.TIMEOUT_MS,
 		);
-		return [];
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		console.error(`Error getting latest emails: ${msg}`);
+		throw new Error(`Error getting latest emails: ${msg}`);
+	}
+}
+
+/**
+ * Reads one message in full, addressed by the `id` a listing returned.
+ *
+ * Looks in the account's inbox (or `mailbox` within it), or the unified inbox
+ * when no account is given. Ids are matched with one bulk `id()` read rather
+ * than `byId`/`whose`, for the same reason as collectorScript.
+ */
+async function readMail(
+	id: number,
+	account?: string,
+	mailbox?: string,
+	maxChars: number = CONFIG.READ_DEFAULT_CHARS,
+): Promise<FullEmailMessage> {
+	const access = await requestMailAccess();
+	if (!access.hasAccess) throw new Error(access.message);
+	if (!Number.isInteger(id)) throw new Error("A numeric message id is required");
+	if (mailbox && !account) throw new Error("A mailbox can only be given together with an account");
+	const cap = Math.max(500, Math.min(Math.floor(maxChars), CONFIG.READ_MAX_CHARS));
+	const boxExpr = account
+		? `(function () {
+             const acct = findAccount(M, ${jsLit(account)});
+             const b = resolveMailbox(acct, ${jsLit(mailbox || "INBOX")}, true);
+             if (!b) throw new Error("No mailbox " + ${jsLit(mailbox || "INBOX")}
+               + " in account " + ${jsLit(account)});
+             return b;
+           })()`
+		: "M.inbox";
+	const script = `
+${MAILBOX_HELPERS}
+const M = Application("Mail");
+const box = ${boxExpr};
+const msgs = box.messages;
+const ids = msgs.id();
+let idx = -1;
+for (let i = 0; i < ids.length; i++) { if (ids[i] === ${id}) { idx = i; break; } }
+if (idx === -1) {
+  throw new Error("No message with id ${id} in " + ${jsLit(
+		account ? `${mailbox || "INBOX"} of account ${account}` : "the unified inbox",
+	)});
+}
+const m = msgs[idx];
+function addrs(coll) {
+  try { return coll.address().map(String); } catch (e) { return []; }
+}
+let content = "";
+try { content = String(m.content() || ""); } catch (e) { content = "[Content not available]"; }
+const truncated = content.length > ${cap};
+if (truncated) content = content.slice(0, ${cap});
+let acctName = ${account ? jsLit(account) : '""'};
+if (!acctName) {
+  try { acctName = String(m.mailbox().account().name()); } catch (e) { acctName = ""; }
+}
+let replyTo = "";
+try { replyTo = String(m.replyTo() || ""); } catch (e) { replyTo = ""; }
+JSON.stringify({
+  id: ${id},
+  account: acctName,
+  mailbox: ${jsLit(mailbox || "Inbox")},
+  subject: String(m.subject() || "(no subject)"),
+  sender: String(m.sender() || ""),
+  dateSent: String(m.dateSent() || ""),
+  isRead: m.readStatus() === true,
+  to: addrs(m.toRecipients),
+  cc: addrs(m.ccRecipients),
+  replyTo: replyTo,
+  content: content,
+  truncated: truncated
+});
+`;
+	try {
+		return await runJxa<FullEmailMessage>(script, CONFIG.TIMEOUT_MS);
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		console.error(`Error reading email: ${msg}`);
+		throw new Error(`Error reading email: ${msg}`);
+	}
+}
+
+/**
+ * Account names with their email addresses, so a caller can find an account
+ * by address (account names are user-editable and often don't contain it).
+ */
+async function getAccountDetails(): Promise<MailAccount[]> {
+	const access = await requestMailAccess();
+	if (!access.hasAccess) throw new Error(access.message);
+	const script = `
+const M = Application("Mail");
+const accts = M.accounts;
+const names = accts.name();
+let bulk = null;
+try { bulk = accts.emailAddresses(); } catch (e) { bulk = null; }
+const out = [];
+for (let i = 0; i < names.length; i++) {
+  let addrs = bulk ? bulk[i] : null;
+  if (!addrs) {
+    try { addrs = accts[i].emailAddresses(); } catch (e) { addrs = []; }
+  }
+  out.push({ name: String(names[i]), emailAddresses: (addrs || []).map(String) });
+}
+JSON.stringify(out);
+`;
+	try {
+		const accounts = await runJxa<MailAccount[]>(script, 30000);
+		return (accounts || []).filter((a) => a && a.name && a.name.trim() !== "");
+	} catch (error) {
+		const msg = error instanceof Error ? error.message : String(error);
+		console.error(`Error getting account details: ${msg}`);
+		throw new Error(`Error getting account details: ${msg}`);
 	}
 }
 
@@ -385,8 +559,13 @@ end tell`;
 
 interface MoveMailOptions {
 	account: string;
-	subject: string;
-	sender: string;
+	/**
+	 * Mail message id from a listing. When given, it alone identifies the
+	 * message; subject and sender are then optional extra checks.
+	 */
+	messageId?: number;
+	subject?: string;
+	sender?: string;
 	/** When set, only a message with this read status matches. */
 	isRead?: boolean;
 	destinationMailbox: string;
@@ -406,19 +585,30 @@ interface MoveMailResult {
 }
 
 /**
- * Moves the newest message in the account's inbox (or `sourceMailbox`) whose
- * subject equals `subject`, whose sender contains `sender`, and whose read
- * status matches `isRead` when given, into `destinationMailbox`.
+ * Moves one message from the account's inbox (or `sourceMailbox`) into
+ * `destinationMailbox`. The message is the one with `messageId` when given;
+ * otherwise the newest whose subject equals `subject` and whose sender contains
+ * `sender`. In both cases `isRead`, `subject` and `sender` (when given) must
+ * also match, so a stale id can't move the wrong message.
  */
 async function moveMail(opts: MoveMailOptions): Promise<MoveMailResult> {
 	const access = await requestMailAccess();
 	if (!access.hasAccess) throw new Error(access.message);
 	if (!opts.account || !opts.account.trim()) throw new Error("Account is required");
-	if (!opts.subject || !opts.subject.trim()) throw new Error("Subject is required");
-	if (!opts.sender || !opts.sender.trim()) throw new Error("Sender is required");
+	const byId = opts.messageId !== undefined && opts.messageId !== null;
+	if (byId && !Number.isInteger(opts.messageId)) throw new Error("messageId must be an integer");
+	if (!byId) {
+		if (!opts.subject || !opts.subject.trim()) throw new Error("Subject (or messageId) is required");
+		if (!opts.sender || !opts.sender.trim()) throw new Error("Sender (or messageId) is required");
+	}
 	if (!opts.destinationMailbox || !opts.destinationMailbox.trim()) {
 		throw new Error("Destination mailbox is required");
 	}
+	const subjectFilter = (opts.subject || "").trim().toLowerCase();
+	const senderFilter = (opts.sender || "").trim().toLowerCase();
+	const describe = byId
+		? `message id ${opts.messageId}`
+		: `message from '${opts.sender}' with subject '${opts.subject}'`;
 	const source = (opts.sourceMailbox || "INBOX").trim();
 	const script = `
 ${MAILBOX_HELPERS}
@@ -439,20 +629,22 @@ const read = msgs.readStatus();
 const subj = msgs.subject();
 const send = msgs.sender();
 const date = msgs.dateSent();
-const wantSubj = ${jsLit(opts.subject.trim().toLowerCase())};
-const wantSender = ${jsLit(opts.sender.trim().toLowerCase())};
+const wantId = ${byId ? String(opts.messageId) : "null"};
+const ids = wantId === null ? null : msgs.id();
+const wantSubj = ${jsLit(subjectFilter)};
+const wantSender = ${jsLit(senderFilter)};
 const wantRead = ${opts.isRead === undefined ? "null" : String(opts.isRead)};
 const matches = [];
 for (let i = 0; i < read.length; i++) {
-  if (String(subj[i] || "").trim().toLowerCase() !== wantSubj) continue;
-  if (String(send[i] || "").toLowerCase().indexOf(wantSender) === -1) continue;
+  if (wantId !== null && ids[i] !== wantId) continue;
+  if (wantSubj && String(subj[i] || "").trim().toLowerCase() !== wantSubj) continue;
+  if (wantSender && String(send[i] || "").toLowerCase().indexOf(wantSender) === -1) continue;
   if (wantRead !== null && (read[i] === true) !== wantRead) continue;
   matches.push(i);
 }
 if (matches.length === 0) {
   throw new Error("No " + (wantRead === null ? "" : wantRead ? "read " : "unread ")
-    + "message from '" + ${jsLit(opts.sender)} + "' with subject '" + ${jsLit(opts.subject)}
-    + "' in " + ${jsLit(source)} + " of account " + ${jsLit(opts.account)});
+    + ${jsLit(describe)} + " in " + ${jsLit(source)} + " of account " + ${jsLit(opts.account)});
 }
 matches.sort(function (a, b) { return (date[b] || 0) - (date[a] || 0); });
 const i = matches[0];
@@ -600,6 +792,8 @@ end tell`;
 export default {
 	getUnreadMails,
 	searchMails,
+	readMail,
+	getAccountDetails,
 	sendMail,
 	moveMail,
 	createMailbox,

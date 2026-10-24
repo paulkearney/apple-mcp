@@ -80,16 +80,19 @@ const CONTACTS_TOOL: Tool = {
   
   const MAIL_TOOL: Tool = {
     name: "mail",
-    description: "Interact with Apple Mail app - read unread emails, search emails, send emails, " +
-      "move a message to a mailbox, create mailboxes, and save drafts",
+    description: "Interact with Apple Mail app - read unread emails, search emails, read one " +
+      "message in full, send emails, move a message to a mailbox, create mailboxes, and save " +
+      "drafts. Listings show each message's Account and Id; pass the Id to 'read' for the full " +
+      "body or to 'move' to move that exact message.",
     inputSchema: {
       type: "object",
       properties: {
         operation: {
           type: "string",
-          description: "Operation to perform: 'unread', 'search', 'send', 'mailboxes', 'accounts', " +
-            "'latest', 'move', 'createMailbox', or 'saveDraft'",
-          enum: ["unread", "search", "send", "mailboxes", "accounts", "latest", "move",
+          description: "Operation to perform: 'unread', 'search', 'read', 'send', 'mailboxes', " +
+            "'accounts' (names with their email addresses), 'latest', 'move', 'createMailbox', " +
+            "or 'saveDraft'",
+          enum: ["unread", "search", "read", "send", "mailboxes", "accounts", "latest", "move",
             "createMailbox", "saveDraft"]
         },
         account: {
@@ -106,9 +109,26 @@ const CONTACTS_TOOL: Tool = {
           type: "string",
           description: "Mailbox path to move the message into (required for move operation)"
         },
+        messageId: {
+          type: "number",
+          description: "Mail message Id from a listing (required for read; for move, identifies " +
+            "the exact message instead of subject + sender). Ids are per mailbox, so for read " +
+            "and move pass the same account (and mailbox, if any) the message was listed in, " +
+            "or no account to look in the unified inbox (read only)"
+        },
+        includeContent: {
+          type: "boolean",
+          description: "For unread, search and latest: false skips fetching message bodies, " +
+            "which is much faster over Exchange (default true)"
+        },
+        maxChars: {
+          type: "number",
+          description: "For read: maximum body length to return (default 8000, max 50000)"
+        },
         sender: {
           type: "string",
-          description: "Sender name or address the message must match (required for move operation)"
+          description: "Sender name or address the message must match (for move: required " +
+            "unless messageId is given)"
         },
         isRead: {
           type: "boolean",
@@ -116,7 +136,8 @@ const CONTACTS_TOOL: Tool = {
         },
         limit: {
           type: "number",
-          description: "Number of emails to retrieve (optional, for unread, search, and latest operations)"
+          description: "Number of emails to retrieve for unread, search and latest (max 20 with " +
+            "content, 100 with includeContent false)"
         },
         searchTerm: {
           type: "string",
@@ -128,7 +149,8 @@ const CONTACTS_TOOL: Tool = {
         },
         subject: {
           type: "string",
-          description: "Email subject (required for send, saveDraft and move operations)"
+          description: "Email subject (required for send and saveDraft; for move: required " +
+            "unless messageId is given)"
         },
         body: {
           type: "string",

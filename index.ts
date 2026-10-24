@@ -7,6 +7,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { runAppleScript } from "run-applescript";
 import tools from "./tools";
+import type { EmailMessage } from "./utils/mail";
 
 
 // Safe mode implementation - lazy loading of modules
@@ -614,6 +615,7 @@ function initServer() {
 								const emails = await mailModule.getUnreadMails(
 									args.limit,
 									args.account,
+									args.includeContent !== false,
 								);
 
 								return {
@@ -622,14 +624,9 @@ function initServer() {
 											type: "text",
 											text:
 												emails.length > 0
-													? `Found ${emails.length} unread email(s)${args.account ? ` in account "${args.account}"` : ""}${args.mailbox ? ` and mailbox "${args.mailbox}"` : ""}:\n\n` +
-														emails
-															.map(
-																(email: any) =>
-																	`[${email.dateSent}] From: ${email.sender}\nMailbox: ${email.mailbox}\nSubject: ${email.subject}\n${email.content.substring(0, 500)}${email.content.length > 500 ? "..." : ""}`,
-															)
-															.join("\n\n")
-													: `No unread emails found${args.account ? ` in account "${args.account}"` : ""}${args.mailbox ? ` and mailbox "${args.mailbox}"` : ""}`,
+													? `Found ${emails.length} unread email(s)${args.account ? ` in account "${args.account}"` : ""}:\n\n` +
+														emails.map((email) => formatEmail(email, 500)).join("\n\n")
+													: `No unread emails found${args.account ? ` in account "${args.account}"` : ""}`,
 										},
 									],
 									isError: false,
@@ -646,6 +643,7 @@ function initServer() {
 									args.searchTerm,
 									args.limit,
 									args.account,
+									args.includeContent !== false,
 								);
 								return {
 									content: [
@@ -653,16 +651,42 @@ function initServer() {
 											type: "text",
 											text:
 												emails.length > 0
-													? `Found ${emails.length} email(s) for "${args.searchTerm}"${args.account ? ` in account "${args.account}"` : ""}${args.mailbox ? ` and mailbox "${args.mailbox}"` : ""}:\n\n` +
-														emails
-															.map(
-																(email: any) =>
-																	`[${email.dateSent}] From: ${email.sender}\nMailbox: ${email.mailbox}\nSubject: ${email.subject}\n${email.content.substring(0, 200)}${email.content.length > 200 ? "..." : ""}`,
-															)
-															.join("\n\n")
-													: `No emails found for "${args.searchTerm}"${args.account ? ` in account "${args.account}"` : ""}${args.mailbox ? ` and mailbox "${args.mailbox}"` : ""}`,
+													? `Found ${emails.length} email(s) for "${args.searchTerm}"${args.account ? ` in account "${args.account}"` : ""}:\n\n` +
+														emails.map((email) => formatEmail(email, 200)).join("\n\n")
+													: `No emails found for "${args.searchTerm}"${args.account ? ` in account "${args.account}"` : ""}`,
 										},
 									],
+									isError: false,
+								};
+							}
+
+							case "read": {
+								if (args.messageId === undefined) {
+									throw new Error("messageId is required for read operation");
+								}
+								const m = await mailModule.readMail(
+									args.messageId,
+									args.account,
+									args.mailbox,
+									args.maxChars,
+								);
+								const lines = [
+									`Account: ${m.account || "(unknown)"} · Mailbox: ${m.mailbox} · Id: ${m.id}`,
+									`Date: ${m.dateSent}`,
+									`From: ${m.sender}`,
+									`To: ${m.to.join(", ") || "(none)"}`,
+								];
+								if (m.cc.length > 0) lines.push(`Cc: ${m.cc.join(", ")}`);
+								if (m.replyTo) lines.push(`Reply-To: ${m.replyTo}`);
+								lines.push(`Subject: ${m.subject}`, `Read: ${m.isRead ? "yes" : "no"}`, "");
+								lines.push(
+									m.content +
+										(m.truncated
+											? "\n\n[Body truncated; pass a larger maxChars to see more]"
+											: ""),
+								);
+								return {
+									content: [{ type: "text", text: lines.join("\n") }],
 									isError: false,
 								};
 							}
@@ -721,14 +745,17 @@ function initServer() {
 							}
 
 							case "accounts": {
-								const accounts = await mailModule.getAccounts();
+								const accounts = await mailModule.getAccountDetails();
 								return {
 									content: [
 										{
 											type: "text",
 											text:
 												accounts.length > 0
-													? `Found ${accounts.length} email accounts:\n\n${accounts.join("\n")}`
+													? `Found ${accounts.length} email accounts (name: addresses):\n\n` +
+														accounts
+															.map((a) => `${a.name}: ${a.emailAddresses.join(", ") || "(no address)"}`)
+															.join("\n")
 													: "No email accounts found. Make sure Mail app is configured with at least one account.",
 										},
 									],
@@ -750,6 +777,7 @@ function initServer() {
 								const emails = await mailModule.getLatestMails(
 									account,
 									args.limit,
+									args.includeContent !== false,
 								);
 								return {
 									content: [
@@ -758,12 +786,7 @@ function initServer() {
 											text:
 												emails.length > 0
 													? `Found ${emails.length} latest email(s) in account "${account}":\n\n` +
-														emails
-															.map(
-																(email: any) =>
-																	`[${email.dateSent}] From: ${email.sender}\nMailbox: ${email.mailbox}\nSubject: ${email.subject}\n${email.content.substring(0, 500)}${email.content.length > 500 ? "..." : ""}`,
-															)
-															.join("\n\n")
+														emails.map((email) => formatEmail(email, 500)).join("\n\n")
 													: `No latest emails found in account "${account}"`,
 										},
 									],
@@ -772,13 +795,16 @@ function initServer() {
 							}
 
 							case "move": {
-								if (!args.account || !args.subject || !args.sender || !args.destinationMailbox) {
+								const hasTarget =
+									args.messageId !== undefined || (!!args.subject && !!args.sender);
+								if (!args.account || !hasTarget || !args.destinationMailbox) {
 									throw new Error(
-										"Account, subject, sender and destinationMailbox are required for move operation",
+										"Account, destinationMailbox and either messageId or subject + sender are required for move operation",
 									);
 								}
 								const moved = await mailModule.moveMail({
 									account: args.account,
+									messageId: args.messageId,
 									subject: args.subject,
 									sender: args.sender,
 									isRead: args.isRead,
@@ -1532,6 +1558,7 @@ const MAIL_OPERATIONS = [
 	"move",
 	"createMailbox",
 	"saveDraft",
+	"read",
 ] as const;
 
 function isMailArgs(args: unknown): args is {
@@ -1548,11 +1575,17 @@ function isMailArgs(args: unknown): args is {
 	body?: string;
 	cc?: string;
 	bcc?: string;
+	messageId?: number;
+	includeContent?: boolean;
+	maxChars?: number;
 } {
 	if (typeof args !== "object" || args === null) return false;
 
 	const {
 		operation,
+		messageId,
+		includeContent,
+		maxChars,
 		account,
 		mailbox,
 		destinationMailbox,
@@ -1604,14 +1637,19 @@ function isMailArgs(args: unknown): args is {
 			if (
 				!account ||
 				typeof account !== "string" ||
-				!subject ||
-				typeof subject !== "string" ||
-				!sender ||
-				typeof sender !== "string" ||
 				!destinationMailbox ||
 				typeof destinationMailbox !== "string"
 			)
 				return false;
+			// Either an exact message id, or subject + sender to match on.
+			if (
+				messageId === undefined &&
+				(!subject || typeof subject !== "string" || !sender || typeof sender !== "string")
+			)
+				return false;
+			break;
+		case "read":
+			if (typeof messageId !== "number" || !Number.isInteger(messageId)) return false;
 			break;
 		case "createMailbox":
 			if (!account || typeof account !== "string" || !mailbox || typeof mailbox !== "string")
@@ -1634,8 +1672,31 @@ function isMailArgs(args: unknown): args is {
 	if (limit && typeof limit !== "number") return false;
 	if (cc && typeof cc !== "string") return false;
 	if (bcc && typeof bcc !== "string") return false;
+	if (messageId !== undefined && (typeof messageId !== "number" || !Number.isInteger(messageId)))
+		return false;
+	if (includeContent !== undefined && typeof includeContent !== "boolean") return false;
+	if (maxChars !== undefined && typeof maxChars !== "number") return false;
 
 	return true;
+}
+
+/**
+ * One listing entry. The Account and Id lines let a caller tell accounts apart
+ * in the unified inbox and address the exact message with `read` or `move`.
+ * The body line is left out when the listing was made without content.
+ */
+function formatEmail(email: EmailMessage, previewChars: number): string {
+	const head =
+		`[${email.dateSent}] From: ${email.sender}\n` +
+		`Account: ${email.account || "(unknown)"} · Mailbox: ${email.mailbox} · ` +
+		`Id: ${email.id ?? "(unknown)"}\n` +
+		`Subject: ${email.subject}`;
+	if (!email.content) return head;
+	const body =
+		email.content.length > previewChars
+			? `${email.content.substring(0, previewChars)}...`
+			: email.content;
+	return `${head}\n${body}`;
 }
 
 function isRemindersArgs(args: unknown): args is {
